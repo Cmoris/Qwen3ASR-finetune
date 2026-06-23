@@ -1,12 +1,12 @@
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 torchrun --nproc_per_node=4 train.py \
-  --deepspeed /home/yizhang/Moris/StreamingSpeechLLM/bin/baseline/scripts/zero2.json \
+  --deepspeed ./scripts/zero2.json \
   --model_path Qwen/Qwen3-ASR-1.7B \
   --data_version "nonstreaming" \
-  --data_dir /n/work6/yizhang/Moris/zoom2025/finetune_labels/l3_conv_train_with_backchannel \
-  --audio_root_a "/n/work6/yizhang/Moris/zoom2025/audios/A_gd" \
-  --audio_root_b "/n/work6/yizhang/Moris/zoom2025/audios/B_gd" \
-  --output_dir /n/work6/yizhang/Moris/Models/StreamingSpeechLLM_with_pos_v2/ASR_CONV_finetune/qwen3-asr-lora16-l3 \
+  --data_dir /ctd/Works/m-wu/Datasets/zoom2025/finetune_labels/l5_conv_train_with_backchannel \
+  --audio_root_a "/ctd/Works/m-wu/Datasets/zoom2025/audios/A_gd" \
+  --audio_root_b "/ctd/Works/m-wu/Datasets/zoom2025/audios/B_gd" \
+  --output_dir /ctd/Works/m-wu/Models/StreamingSpeechLLM_with_pos/ASR_CONV_finetune/qwen3-asr-lora16-l3 \
   --lora_enable true \
   --lora_r 16 \
   --lora_alpha 32 \
