@@ -1,0 +1,5 @@
+__pycache__
+*.log
+*.jsonl
+*.json
+Qwen3-ASR
