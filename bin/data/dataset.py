@@ -392,10 +392,10 @@ if __name__ == "__main__":
     
     logger = setup_logger("debug.log")
     
-    dir = "/n/work6/yizhang/Moris/zoom2025/finetune_labels/l3_conv_train_with_backchannel"
+    dir = "/ctd/Works/m-wu/Datasets/zoom2025/finetune_labels/l10_conv_train_with_backchannel"
 
     asr_wrapper = Qwen3ASRModel.from_pretrained(
-        "/n/work6/yizhang/Moris/Models/StreamingSpeechLLM/ASR_CONV_finetune/qwen3-asr-sft-l3/checkpoint-9100",
+        "Qwen/Qwen3-ASR-1.7B",
         dtype=torch.bfloat16,
         device_map=None,
     )
@@ -432,8 +432,8 @@ Output the transcript in chronological order."""
     ds = DualChannelConvDataset(
         annotation_paths=[str(path) for path in Path(dir).glob("*.jsonl")],
         processor=processor,
-        audio_root_a="/n/work6/yizhang/Moris/zoom2025/audios/A_gd",
-        audio_root_b="/n/work6/yizhang/Moris/zoom2025/audios/B_gd",
+        audio_root_a="/ctd/Works/m-wu/Datasets/zoom2025/audios/A_gd",
+        audio_root_b="/ctd/Works/m-wu/Datasets/zoom2025/audios/B_gd",
         query=query
     )
     print(f"Dataset length: {len(ds)}")
@@ -441,13 +441,12 @@ Output the transcript in chronological order."""
     loader = DataLoader(ds, batch_size=1, shuffle=True, collate_fn=collator)
     max_size = 0
     for batch in tqdm.tqdm(loader):
-        breakpoint()
+        
         if batch['input_features'].size(2) > max_size:
             max_size = batch['input_features'].size(2)
         if batch['input_features'].size(2) > 2000:
             print(max_size)
             breakpoint()
-        logger.info(f"records: {batch["records"]}")
         logger.info(f"num input features: {batch['input_features'].size()}")
         logger.info(f"attention mask size: {batch["attention_mask"].size()}")
         logger.info(f"feature attention mask size: {batch["feature_attention_mask"].size()}")

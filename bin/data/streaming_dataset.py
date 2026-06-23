@@ -168,41 +168,51 @@ def _speaker_span(speaker: str, text: str) -> str:
         raise ValueError(f"Unknown speaker: {speaker}")
 
 
-def _partial_text_by_time(text: str, start: float, end: float, t_now: float) -> str:
+def _partial_text_by_interval(
+    text: str,
+    utt_start: float,
+    utt_end: float,
+    interval_start: float,
+    interval_end: float,
+) -> str:
     """
-    对正在说的 utterance 生成 prefix 文本。
-    不依赖 char-level text_stream，直接按 utterance duration 做近似切分。
-
-    例如:
-        text = "こんにちはよろしくお願いします"
-        t_now 在 utterance 40% 位置
-        返回前 40% 字符
+    从一个 utterance 中截取 [interval_start, interval_end] 对应的部分文本。
+    用 utterance 内部均匀时间近似切字符。
     """
     text = text.strip()
     if not text:
         return ""
 
-    if t_now >= end:
-        return text
-
-    if t_now <= start:
+    # 没有重叠
+    if interval_end <= utt_start or interval_start >= utt_end:
         return ""
 
-    duration = max(end - start, 1e-6)
-    ratio = (t_now - start) / duration
-    n_chars = int(len(text) * ratio)
+    duration = max(utt_end - utt_start, 1e-6)
+    n = len(text)
 
-    # 至少说到一点点时给 1 个字符，避免刚开始完全空
-    if ratio > 0:
-        n_chars = max(1, n_chars)
+    left = max(interval_start, utt_start)
+    right = min(interval_end, utt_end)
 
-    return text[:n_chars]
+    left_ratio = (left - utt_start) / duration
+    right_ratio = (right - utt_start) / duration
+
+    char_start = int(np.floor(left_ratio * n))
+    char_end = int(np.ceil(right_ratio * n))
+
+    char_start = max(0, min(n, char_start))
+    char_end = max(0, min(n, char_end))
+
+    if char_end <= char_start:
+        return ""
+
+    return text[char_start:char_end]
 
 
 def build_prefix_target_from_utterances(
     utterances: list[dict],
     t_now: float,
     *,
+    window_start: Optional[float] = None,
     allow_partial_utterance: bool = True,
     add_event_only_when_utterance_finished: bool = True,
     keep_complete_sentence: bool = False,
@@ -219,6 +229,9 @@ def build_prefix_target_from_utterances(
     """
 
     parts = []
+
+    if window_start is None:
+        window_start = float("-inf")
 
     # 关键：按 utterance 起点排序，而不是按 char token end 排序
     utts = sorted(
@@ -238,6 +251,9 @@ def build_prefix_target_from_utterances(
         if u_start > t_now:
             continue
 
+        if u_end <= window_start:
+            continue
+
         speaker = u["speaker"]
         full_text = u.get("text", "").strip()
 
@@ -246,32 +262,38 @@ def build_prefix_target_from_utterances(
 
         is_finished = u_end <= t_now
 
-        if is_finished:
+        if u_start >= window_start and is_finished:
             text = full_text
+
         else:
             if keep_complete_sentence:
                 # 严格完整句子模式：
-                # utterance 没结束就不输出这句话
+                # 只输出完整落在 [window_start, t_now] 内的 utterance
                 continue
 
             if not allow_partial_utterance:
                 continue
 
-            text = _partial_text_by_time(
+            text = _partial_text_by_interval(
                 full_text,
-                u_start,
-                u_end,
-                t_now,
+                utt_start=u_start,
+                utt_end=u_end,
+                interval_start=window_start,
+                interval_end=t_now,
             )
 
         if not text:
             continue
 
         parts.append(_speaker_span(speaker, text))
+        
+        # 事件 token 发生在 utterance 结束处。
+        # 只有 utterance end 在当前窗口内，才输出事件。
+        event_time_in_window = window_start < u_end <= t_now
 
-        # 事件 token 最好只在 utterance 完成之后输出
-        if is_finished or not add_event_only_when_utterance_finished:
-            parts.append(_event_suffix_from_utterance(u))
+        if event_time_in_window:
+            if is_finished or not add_event_only_when_utterance_finished:
+                parts.append(_event_suffix_from_utterance(u))
 
     return "".join(parts)
 
@@ -439,6 +461,7 @@ class DualChannelConvStreamingDataset(Dataset):
         max_prefix_samples_per_record: Optional[int] = None,
         close_unfinished_speaker: bool = False,
         non_speech_token: str = NON_SPEECH_TOKEN,
+        max_audio_context_secs: float=30.0
     ):
         super().__init__()
 
@@ -453,6 +476,7 @@ class DualChannelConvStreamingDataset(Dataset):
         self.max_prefix_samples_per_record = max_prefix_samples_per_record
         self.close_unfinished_speaker = close_unfinished_speaker
         self.non_speech_token = non_speech_token
+        self.max_audio_context_secs = max_audio_context_secs
         # ── special token ids for label masking  ──────────────
         
         (
@@ -515,6 +539,17 @@ class DualChannelConvStreamingDataset(Dataset):
         else:
             path, seek = self.handles[index]
         return self._load_record_from_handle(path, seek)
+    
+    def _get_audio_window_start(
+        self,
+        *,
+        t_start: float,
+        t_now: float,
+    ) -> float:
+        if t_now <= t_start:
+            t_now = t_start + 1.0 / self.sr
+
+        return max(t_start, t_now - self.max_audio_context_secs)
 
     def _resolve_audio_prefix(
         self,
@@ -522,7 +557,6 @@ class DualChannelConvStreamingDataset(Dataset):
         *,
         t_start: float,
         t_now: float,
-        max_audio_context_secs: float = 30.0,
     ) -> list[dict]:
         uttr = ele["content"][0]["utterances"]
         conv_id = ele["content"][1]["id"]
@@ -531,7 +565,10 @@ class DualChannelConvStreamingDataset(Dataset):
         if t_now <= t_start:
             t_now = t_start + 1.0 / self.sr
 
-        audio_start = max(t_start, t_now - max_audio_context_secs)
+        audio_start = self._get_audio_window_start(
+            t_start=t_start,
+            t_now=t_now,
+        )
 
         audio_dict = {
             "A": {
@@ -579,9 +616,15 @@ class DualChannelConvStreamingDataset(Dataset):
 
         utterances = record[0]["content"][0]["utterances"]
 
+        audio_window_start = self._get_audio_window_start(
+            t_start=t_start,
+            t_now=t_now,
+        )
+
         target_body = build_prefix_target_from_utterances(
             utterances=utterances,
             t_now=t_now,
+            window_start=audio_window_start,
             allow_partial_utterance=True,
             keep_complete_sentence=False,
         )
@@ -590,8 +633,12 @@ class DualChannelConvStreamingDataset(Dataset):
         # This makes the sample explicitly teach "no new speech output now" without accumulating
         # infinite <non_speech><non_speech>... in the transcript history.
 
-        audio_list = self._resolve_audio_prefix(user_turn, t_start=t_start, t_now=t_now)
-        
+        audio_list = self._resolve_audio_prefix(
+            user_turn,
+            t_start=t_start,
+            t_now=t_now,
+        )
+
         conversation, audio_inputs = build_prefix_conversation(
             audio_list,
             query=self.query,
@@ -709,7 +756,7 @@ if __name__ == "__main__":
     
     logger = setup_logger("debug.log")
     
-    dir = "/n/work6/yizhang/Moris/zoom2025/finetune_labels/l3_conv_train_with_backchannel"
+    dir = "/ctd/Works/m-wu/Datasets/zoom2025/finetune_labels/l10_conv_train_with_backchannel"
 
     asr_wrapper = Qwen3ASRModel.from_pretrained(
         "Qwen/Qwen3-ASR-1.7B",
@@ -750,11 +797,12 @@ Output the transcript in chronological order."""
     ds = DualChannelConvStreamingDataset(
         annotation_paths=[str(path) for path in Path(dir).glob("*.jsonl")],
         processor=processor,
-        audio_root_a="/n/work6/yizhang/Moris/zoom2025/audios/A_gd",
-        audio_root_b="/n/work6/yizhang/Moris/zoom2025/audios/B_gd",
+        audio_root_a="/ctd/Works/m-wu/Datasets/zoom2025/audios/A_gd",
+        audio_root_b="/ctd/Works/m-wu/Datasets/zoom2025/audios/B_gd",
         query=query,
         sample_strategy="event",
-        prefix_time_strategy="all"
+        prefix_time_strategy="all",
+        max_audio_context_secs=60.0
     )
     print(f"Dataset length: {len(ds)}")
     collator = DataCollatorForDualChannelQwen3ASRFinetuning(processor)
