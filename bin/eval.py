@@ -1,16 +1,37 @@
 import os
 import json
 import argparse
-from typing import Tuple
 from pathlib import Path
 import numpy as np
-import soundfile as sf
+from types import MethodType
+
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
+from transformers import GenerationConfig
 
 from data import DualChannelConvDataset, DataCollatorForDualChannelQwen3ASRFinetuning
+from data.collator import build_dual_channel_position_ids
 from infer_utils import speaker_cer, special_token_f1_sequence
 from qwen_asr import Qwen3ASRModel
+from inference import dual_channel_forward
+
+def make_json_serializable(obj):
+    """
+    防止 numpy 类型不能 json.dump。
+    """
+    if isinstance(obj, dict):
+        return {k: make_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [make_json_serializable(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(make_json_serializable(v) for v in obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
 
 def normalize_text_for_eval(text: str) -> str:
     """
@@ -31,6 +52,15 @@ def normalize_text_for_eval(text: str) -> str:
         idx = text.find("<speaker_")
         text = text[idx:]
 
+    for token in [
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<|im_start|>",
+        "<|object_ref_start|>",
+        "<|object_ref_end|>",
+    ]:
+        text = text.replace(token, "")
+
     return text.strip()
 
 def _print_result(title: str, results) -> None:
@@ -45,7 +75,7 @@ def _print_result(title: str, results) -> None:
             print(f"[sample {i}] ts_last : {tail.text!r} {tail.start_time}->{tail.end_time} s")
 
 def parse_args():
-    p = argparse.ArgumentParser("Qwen3-ASR Streaming Evaluation")
+    p = argparse.ArgumentParser("Qwen3-ASR Non-streaming Evaluation")
 
     p.add_argument("--data_dir", type=str, default="train.jsonl")
     p.add_argument(
@@ -64,6 +94,11 @@ def parse_args():
         type=int,
         default=4,
     )
+    p.add_argument("--num_workers", type=int, default=16)
+    p.add_argument("--max_new_tokens", type=int, default=256)
+
+    p.add_argument("--use_pos_emb", type=bool, default=False)
+    p.add_argument("--use_channel_emb", type=bool, default=False)
 
     p.add_argument(
         "--model_path",
@@ -74,10 +109,23 @@ def parse_args():
     p.add_argument(
         "--output_jsonl",
         type=str,
-        default="streaming_eval_results.jsonl",
+        default="eval_results.jsonl",
     )
 
     return p.parse_args()
+
+def expand_annotation_paths(data_dir: str) -> list[str]:
+    path = Path(data_dir)
+    if path.is_file():
+        if path.suffix not in {".jsonl", ".json"}:
+            raise ValueError(f"Unsupported annotation file: {path}")
+        return [str(path)]
+    if path.is_dir():
+        paths = sorted(str(p) for p in path.glob("*.jsonl"))
+        if not paths:
+            raise ValueError(f"No .jsonl files found under: {path}")
+        return paths
+    raise FileNotFoundError(f"data_dir does not exist: {path}")
 
 def rank_output_path(base_path: str | Path, shard_id: int, num_shards: int) -> Path:
     base_path = Path(base_path)
@@ -101,14 +149,8 @@ def compute_metrics(pred_text: str, ref_text: str):
         "special_token_f1_sequence": f1_res,
     }
     
-def update_summary(summary, metrics: dict):
-    """
-    累积 corpus-level 统计。
-    这里 speaker CER 用 edits/ref_chars 做 micro 统计。
-    special sequence F1 用 tp_lcs/fp/fn 累积。
-    """
-
-    summary = {
+def new_summary_item():
+    return {
         "num_samples": 0,
         "speaker": {
             "speaker_A": {"edits": 0, "ref_chars": 0},
@@ -122,7 +164,14 @@ def update_summary(summary, metrics: dict):
         },
     }
 
-    item = summary
+def update_summary(summary: dict, metrics: dict):
+    """
+    累积 corpus-level 统计。
+    这里 speaker CER 用 edits/ref_chars 做 micro 统计。
+    special sequence F1 用 tp_lcs/fp/fn 累积。
+    """
+
+    item = summary.setdefault("overall", new_summary_item())
     item["num_samples"] += 1
 
     cer = metrics["speaker_cer"]
@@ -142,6 +191,61 @@ def update_summary(summary, metrics: dict):
     item["special_sequence"]["tp"] += int(tp)
     item["special_sequence"]["fp"] += int(fp)
     item["special_sequence"]["fn"] += int(fn)
+
+def patch_outer_forward(model):
+    cls = model.__class__
+    if getattr(cls, "_eval_forward_patched", False):
+        return
+
+    if not hasattr(model, "thinker") or not hasattr(model.thinker, "forward"):
+        raise RuntimeError("Cannot patch forward: model has no `.thinker.forward`.")
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        input_features=None,
+        feature_attention_mask=None,
+        labels=None,
+        **kwargs,
+    ):
+        return self.thinker.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            input_features=input_features,
+            feature_attention_mask=feature_attention_mask,
+            labels=labels,
+            **kwargs,
+        )
+
+    cls.forward = forward
+    cls._eval_forward_patched = True
+
+def move_batch_to_device(batch, device, dtype):
+    out = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            value = value.to(device)
+            if value.is_floating_point():
+                value = value.to(dtype)
+        out[key] = value
+    return out
+
+def get_model_device_dtype(model):
+    try:
+        param = next(model.parameters())
+    except StopIteration:
+        return torch.device("cpu"), torch.float32
+    return param.device, param.dtype
+
+def audio_paths_from_audio_list(audio_list):
+    paths_a, paths_b = [], []
+    for audio_info in audio_list:
+        a_info = audio_info.get("A")
+        b_info = audio_info.get("B")
+        paths_a.append(str(a_info["audio"]) if a_info is not None else None)
+        paths_b.append(str(b_info["audio"]) if b_info is not None else None)
+    return paths_a, paths_b
 
 
 def finalize_summary(summary):
@@ -172,19 +276,22 @@ def main() -> None:
     
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-    device = f"cuda:{rank}"
+    if torch.cuda.is_available():
+        device = f"cuda:{rank % torch.cuda.device_count()}"
+    else:
+        device = "cpu"
     ASR_MODEL_PATH = data_args.model_path
     
     asr_wrapper = Qwen3ASRModel.from_pretrained(
         ASR_MODEL_PATH,
-        dtype=torch.bfloat16,
+        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         # attn_implementation="flash_attention_2",
         max_inference_batch_size=32,
-        max_new_tokens=256,
+        max_new_tokens=data_args.max_new_tokens,
         device_map=device
     )
     
-    query = """You are a streaming dialogue transcriber.
+    query = """You are a dialogue transcriber.
 
 Transcribe the speech from Speaker A and Speaker B.
 
@@ -200,8 +307,22 @@ Output the transcript in chronological order."""
     
     model = asr_wrapper.model
     processor = asr_wrapper.processor
+    model.eval()
 
-    annotation_paths = [str(path) for path in Path(data_args.data_dir).glob("*.jsonl")]
+    if data_args.use_pos_emb or data_args.use_channel_emb:
+        model.thinker.forward = MethodType(dual_channel_forward, model.thinker)
+        
+        if data_args.use_channel_emb and not hasattr(model.thinker, "audio_channel_embed"):
+            raise RuntimeError(
+                "use_channel_emb=True requires model.thinker.audio_channel_embed. "
+                "Load a checkpoint that contains this module or run without --use_channel_emb."
+            )
+        
+    patch_outer_forward(model)
+
+    model.generation_config = GenerationConfig.from_model_config(model.config)
+
+    annotation_paths = expand_annotation_paths(data_args.data_dir)
 
     dataset = DualChannelConvDataset(
         annotation_paths=annotation_paths,
@@ -217,13 +338,15 @@ Output the transcript in chronological order."""
         rank=rank,
         shuffle=False,
     )
-    collator = DataCollatorForDualChannelQwen3ASRFinetuning(processor)
+    collator = DataCollatorForDualChannelQwen3ASRFinetuning(processor=processor,
+                                                            use_channel_emb=data_args.use_channel_emb,
+                                                            use_pos_emb=data_args.use_pos_emb)
     
     dataloader = DataLoader(
         dataset=dataset,
         batch_size=data_args.batch_size,
         sampler=sampler,
-        num_workers=16,
+        num_workers=data_args.num_workers,
         collate_fn=collator,
         pin_memory=True,
     )
@@ -245,15 +368,17 @@ Output the transcript in chronological order."""
                 "prefix_texts": batch.pop("prefix_texts"),
                 "audio_path_a": batch.pop("audio_path_a"),
                 "audio_path_b": batch.pop("audio_path_b"),
+                "audio_list": batch.pop("audio_list"),
             }
             
             batch = batch["prefix_inputs"]
 
-            batch = batch.to(model.device).to(model.dtype)
+            model_device, model_dtype = get_model_device_dtype(model)
+            batch = move_batch_to_device(batch, model_device, model_dtype)
 
             outputs = model.generate(
                 **batch,
-                max_new_tokens=256,
+                max_new_tokens=data_args.max_new_tokens,
             )
             
             input_len = batch["input_ids"].size(1)
@@ -267,7 +392,7 @@ Output the transcript in chronological order."""
 
             pred_texts = processor.batch_decode(
                 gen_ids,
-                skip_special_tokens=True,
+                skip_special_tokens=False,
                 clean_up_tokenization_spaces=False,
             )
 
@@ -289,11 +414,26 @@ Output the transcript in chronological order."""
                     "ref_text": ref_text,
                     "audio_path_a": meta["audio_path_a"][i],
                     "audio_path_b": meta["audio_path_b"][i],
+                    "prefix_text": meta["prefix_texts"][i],
                     "metrics": metrics,
                 }
                 
                 fout.write(json.dumps(result, ensure_ascii=False) + "\n")
                 fout.flush()
+
+    summary = finalize_summary(summary)
+
+    summary_path = output_path.with_suffix(".summary.json")
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            make_json_serializable(summary),
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+        
+    print(f"Saved jsonl results to: {output_path}")
+    print(f"Saved summary to: {summary_path}")
 
 if __name__ == "__main__":
     main()

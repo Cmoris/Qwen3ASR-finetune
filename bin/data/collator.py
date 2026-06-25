@@ -123,13 +123,15 @@ def build_dual_channel_position_ids(
 
 @dataclass
 class DataCollatorForDualChannelQwen3ASRFinetuning:
+    use_pos_emb: bool
+    use_channel_emb: bool
     processor: Any
     eos_text: str = "<|im_end|>"
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         prefix_texts = [f["prefix_text"] for f in features]
         targets = [f["target"] for f in features]
-        audio_lists = [f["audio_list"] for f in features]
+        conv_ids = [f["conv_id"] for f in features]
 
         # 每条样本可以有多个 audio，batch 内展开
         audios = []
@@ -158,35 +160,30 @@ class DataCollatorForDualChannelQwen3ASRFinetuning:
             truncation=False,
         )
         
-        
-        # input_ids = full_inputs['input_ids']
-        # seq_length = input_ids.size(1)
-        # audio_pad_id = self.processor.tokenizer.encode("<|audio_pad|>")[0]
-        # breakpoint()
-        # audio_pad_id_idx = torch.where((input_ids == audio_pad_id)[0])[0]
-        
-        # position_ids = torch.arange(seq_length, device=input_ids.device)
-        # position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-        # position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
-        audio_pad_id = self.processor.tokenizer.encode("<|audio_pad|>")[0]
-        audio_start_id = self.processor.tokenizer.encode("<|audio_start|>")[0]
-        audio_end_id = self.processor.tokenizer.encode("<|audio_end|>")[0]
+        if self.use_pos_emb:
+            audio_pad_id = self.processor.tokenizer.encode("<|audio_pad|>")[0]
+            audio_start_id = self.processor.tokenizer.encode("<|audio_start|>")[0]
+            audio_end_id = self.processor.tokenizer.encode("<|audio_end|>")[0]
 
-        position_ids = build_dual_channel_position_ids(
-            input_ids=full_inputs["input_ids"],
-            attention_mask=full_inputs["attention_mask"],
-            audio_pad_id=audio_pad_id,
-            audio_start_id=audio_start_id,
-            audio_end_id=audio_end_id,
-            num_channels=2,
-            include_audio_boundary_tokens=True,
-        )
+            position_ids = build_dual_channel_position_ids(
+                input_ids=full_inputs["input_ids"],
+                attention_mask=full_inputs["attention_mask"],
+                audio_pad_id=audio_pad_id,
+                audio_start_id=audio_start_id,
+                audio_end_id=audio_end_id,
+                num_channels=2,
+                include_audio_boundary_tokens=True,
+            )
+
+            full_inputs["position_ids"] = position_ids
+            prefix_inputs["position_ids"] = position_ids
         
-        audio_nums = full_inputs['feature_attention_mask'].size(0)
-        audio_channel_ids = torch.tensor([0,1]*(audio_nums//2), dtype=torch.long)
-        
-        full_inputs["position_ids"] = position_ids
-        full_inputs["audio_channel_ids"] = audio_channel_ids
+        if self.use_channel_emb:
+            audio_nums = full_inputs['feature_attention_mask'].size(0)
+            audio_channel_ids = torch.tensor([0,1]*(audio_nums//2), dtype=torch.long)
+            
+            full_inputs["audio_channel_ids"] = audio_channel_ids
+            prefix_inputs["audio_channel_ids"] = audio_channel_ids
         
         prefix_lens = prefix_inputs["attention_mask"].sum(dim=1).tolist()
 
@@ -204,8 +201,6 @@ class DataCollatorForDualChannelQwen3ASRFinetuning:
         full_inputs["prefix_texts"] = prefix_texts
         full_inputs["target_texts"] = targets
         
-        full_inputs["audio_path_a"] = [getattr(a[0]["A"], "audio", None) for a in audio_lists]
-        full_inputs["audio_path_b"] = [getattr(a[0]["B"], "audio", None) for a in audio_lists]
         
         return full_inputs
     

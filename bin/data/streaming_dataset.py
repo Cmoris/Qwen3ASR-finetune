@@ -1,148 +1,138 @@
 import json
 import random
 from pathlib import Path
-from typing import Optional, Any, Literal
-import numpy as np
+from typing import Optional
 
+import numpy as np
 import soundfile as sf
 import librosa
-
 import torch
 from torch.utils.data import Dataset
-from transformers import AutoProcessor, logging
+from transformers import AutoProcessor
+
 import sys
 sys.path.append("../")
-from constants import (TS_TOKEN, TE_TOKEN, BC_TOKEN, PAUSE_TOKEN, SILENCE_TOKEN,
-                       SPEAKER_TOKENS, STREAMING_CONT, DEFAULT_CHUNK_SECS, DEFAULT_SAMPLE_RATE, DEFAULT_CONTEXT_LENGTH)
 
-# logger = logging.get_logger(__name__)
+from constants import (
+    TS_TOKEN, TE_TOKEN, BC_TOKEN, PAUSE_TOKEN, SILENCE_TOKEN,
+    SPEAKER_TOKENS, STREAMING_CONT,
+    DEFAULT_CHUNK_SECS, DEFAULT_SAMPLE_RATE, DEFAULT_CONTEXT_LENGTH,
+)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Low-level helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
-def read_audio(ele: dict):
-    path = ele["audio"]
+def make_dummy_audio(num_samples: int, noise_scale: float = 1e-4) -> torch.Tensor:
+    return torch.randn(num_samples) * noise_scale
 
-    # 1. 读取音频，不走 torchcodec
-    wav, orig_sr = sf.read(path, dtype="float32")
 
-    # stereo / multi-channel -> mono
+def read_audio_segment(path, audio_start, audio_end, target_sr=16000):
+    wav, orig_sr = sf.read(str(path), dtype="float32")
+
     if wav.ndim > 1:
         wav = wav.mean(axis=1)
 
     audio_duration = len(wav) / orig_sr
 
-    audio_start = ele.get("audio_start", None)
-    audio_end = ele.get("audio_end", None)
-
-    if audio_start is None:
-        audio_start = 0.0
-    if audio_end is None:
-        audio_end = audio_duration
-
-    # 防止越界
     audio_start = max(0.0, float(audio_start))
     audio_end = min(float(audio_end), audio_duration)
 
     if audio_end <= audio_start:
-        # 避免空音频
         audio_end = min(audio_start + 1.0 / orig_sr, audio_duration)
 
-    # 2. 先在原采样率下裁剪
     start_sample = int(round(audio_start * orig_sr))
     end_sample = int(round(audio_end * orig_sr))
+
     clip = wav[start_sample:end_sample]
 
-    # 3. 重采样到 DEFAULT_SAMPLE_RATE
-    if orig_sr != DEFAULT_SAMPLE_RATE:
+    if orig_sr != target_sr:
         clip = librosa.resample(
             clip,
             orig_sr=orig_sr,
-            target_sr=DEFAULT_SAMPLE_RATE,
+            target_sr=target_sr,
         )
-        audio_sr = DEFAULT_SAMPLE_RATE
-    else:
-        audio_sr = orig_sr
 
-    # 4. 构造 clip_pts，对应重采样后的每个 sample 的原始时间戳
-    nframes = len(clip)
-    clip_pts = audio_start + np.arange(nframes) / DEFAULT_SAMPLE_RATE
-
-    clip = torch.from_numpy(clip).float()
-
-    return clip, clip_pts, audio_sr
+    return torch.from_numpy(clip).float()
 
 
-def make_dummy_audio(num_samples: int, noise_scale: float = 1e-4) -> torch.Tensor:
-    """用极小噪声代替静音，避免被 feature extractor 当成 padding 截断"""
-    return torch.randn(num_samples) * noise_scale
+def _read_last_line(path: str, buf: int = 4096) -> str:
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        pos, last = size, b""
+
+        while pos > 0:
+            read_sz = min(buf, pos)
+            pos -= read_sz
+            f.seek(pos)
+
+            chunk = f.read(read_sz)
+            lines = (chunk + last).split(b"\n")
+            last = lines[0]
+
+            non_empty = [l for l in lines[1:] if l.strip()]
+            if non_empty:
+                return non_empty[-1].decode("utf-8")
+
+    return last.decode("utf-8")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Incremental / prefix-streaming helpers for Qwen3-ASR style SFT
-# ─────────────────────────────────────────────────────────────────────────────
+def extract_user_parts(record):
+    """
+    record:
+    [
+      {"role": "user", ...},
+      {"role": "assistant", ...}
+    ]
+    """
+    user_msg = record[0]
+    assistant_msg = record[1]
 
-NON_SPEECH_TOKEN = "<non_speech>"
+    utterances = user_msg["content"][0]["utterances"]
+    conv_id = user_msg["content"][1]["id"]
 
-_KIND_TO_EVENT_TOKEN = {
-    "ts": TS_TOKEN,
-    "te": TE_TOKEN,
-    "bc": BC_TOKEN,
-    "pause": PAUSE_TOKEN,
-    "silence": SILENCE_TOKEN,
-}
+    text_stream = assistant_msg["content"][0]["text_stream"]
 
-
-def _speaker_open(speaker: str) -> str:
-    # SPEAKER_TOKENS is expected to be like {"A": ("<speaker_A>", "</speaker_A>"), ...}
-    if speaker in SPEAKER_TOKENS:
-        return SPEAKER_TOKENS[speaker][0]
-    return f"<speaker_{speaker}>"
+    return conv_id, utterances, text_stream
 
 
-def _speaker_close(speaker: str) -> str:
-    if speaker in SPEAKER_TOKENS:
-        return SPEAKER_TOKENS[speaker][1]
-    return f"</speaker_{speaker}>"
+def get_dialog_time_range(utterances, text_stream=None):
+    starts = [u["start"] for u in utterances]
+    ends = [u["end"] for u in utterances]
+
+    if text_stream is not None:
+        starts += [x["start"] for x in text_stream]
+        ends += [x["end"] for x in text_stream]
+
+    return min(starts), max(ends)
 
 
-def get_record_utterances(record: list | dict) -> list[dict]:
-    """Support your current record format: [user_turn, assistant_turn]."""
-    user_turn = record[0] if isinstance(record, list) else record
-    return user_turn["content"][0]["utterances"]
-
-
-def get_record_conv_id(record: list | dict) -> str:
-    user_turn = record[0] if isinstance(record, list) else record
-    return str(user_turn["content"][1]["id"])
-
-
-def get_record_text_stream(record: list | dict) -> list[dict]:
-    """Read assistant text_stream from [user_turn, assistant_turn]."""
-    if not isinstance(record, list) or len(record) < 2:
-        return []
-    return record[1]["content"][0].get("text_stream", [])
-
-
-def get_dialog_time_range(utterances: list[dict], text_stream: Optional[list[dict]] = None) -> tuple[float, float]:
-    """Use utterance time as the stable audio range; text_stream may contain zero-length events."""
+def build_cutoff_times(
+    t_start: float,
+    t_end: float,
+    chunk_secs: float,
+    include_event_times: bool = True,
+    text_stream: Optional[list] = None,
+):
     times = []
-    for u in utterances:
-        times.append((float(u["start"]), float(u["end"])))
-    if not times and text_stream:
+
+    cur = t_start + chunk_secs
+    while cur < t_end:
+        times.append(round(cur, 3))
+        cur += chunk_secs
+
+    times.append(round(t_end, 3))
+
+    if include_event_times and text_stream is not None:
         for x in text_stream:
-            times.append((float(x["start"]), float(x["end"])))
-    if not times:
-        raise ValueError("empty utterances/text_stream; cannot determine audio range")
-    return min(s for s, _ in times), max(e for _, e in times)
+            tok = x["token"]
+            kind = x.get("kind", "")
+            if tok.startswith("<") or kind in {"ts", "te", "pause", "silence", "bc"}:
+                times.append(round(float(x["end"]), 3))
+
+    times = sorted(set(t for t in times if t_start < t <= t_end))
+    return times
 
 
-def _event_suffix_from_utterance(u: dict) -> str:
-    """
-    从 utterance-level flags 构造事件 token。
-    顺序可以按你原来的定义调整。
-    """
+def build_event_suffix_from_utterance(u):
     suffix = ""
 
     if u.get("is_turn_taking", False):
@@ -159,292 +149,132 @@ def _event_suffix_from_utterance(u: dict) -> str:
     return suffix
 
 
-def _speaker_span(speaker: str, text: str) -> str:
-    if speaker == "A":
-        return f"{SPEAKER_TOKENS['A'][0]}{text}{SPEAKER_TOKENS['A'][1]}"
-    elif speaker == "B":
-        return f"{SPEAKER_TOKENS['B'][0]}{text}{SPEAKER_TOKENS['B'][1]}"
-    else:
-        raise ValueError(f"Unknown speaker: {speaker}")
-
-
-def _partial_text_by_interval(
-    text: str,
-    utt_start: float,
-    utt_end: float,
-    interval_start: float,
-    interval_end: float,
-) -> str:
+def collect_asr_prefix_for_utterance(
+    text_stream,
+    utterance,
+    cutoff_time: float,
+):
     """
-    从一个 utterance 中截取 [interval_start, interval_end] 对应的部分文本。
-    用 utterance 内部均匀时间近似切字符。
+    从 text_stream 里取出属于当前 utterance 的、cutoff 之前的 ASR token。
+    事件 token 不在这里处理。
     """
-    text = text.strip()
-    if not text:
-        return ""
+    speaker = utterance["speaker"]
+    u_start = float(utterance["start"])
+    u_end = float(utterance["end"])
 
-    # 没有重叠
-    if interval_end <= utt_start or interval_start >= utt_end:
-        return ""
+    toks = []
 
-    duration = max(utt_end - utt_start, 1e-6)
-    n = len(text)
+    for x in text_stream:
+        if x.get("speaker") != speaker:
+            continue
 
-    left = max(interval_start, utt_start)
-    right = min(interval_end, utt_end)
+        kind = x.get("kind", "asr")
+        token = x["token"]
 
-    left_ratio = (left - utt_start) / duration
-    right_ratio = (right - utt_start) / duration
+        # 这里只收 ASR / overlap 文本 token，不收事件 token
+        if kind not in {"asr", "overlap"}:
+            continue
+        if token.startswith("<"):
+            continue
 
-    char_start = int(np.floor(left_ratio * n))
-    char_end = int(np.ceil(right_ratio * n))
+        xs = float(x["start"])
+        xe = float(x["end"])
 
-    char_start = max(0, min(n, char_start))
-    char_end = max(0, min(n, char_end))
+        # token 属于这个 utterance 的时间范围，并且已经出现在 cutoff 前
+        if xs >= u_start and xe <= min(u_end, cutoff_time):
+            toks.append(token)
 
-    if char_end <= char_start:
-        return ""
-
-    return text[char_start:char_end]
+    return "".join(toks)
 
 
-def build_prefix_target_from_utterances(
-    utterances: list[dict],
-    t_now: float,
-    *,
-    window_start: Optional[float] = None,
-    allow_partial_utterance: bool = True,
-    add_event_only_when_utterance_finished: bool = True,
-    keep_complete_sentence: bool = False,
-) -> str:
+def build_parallel_utterance_prefix_target(
+    utterances,
+    text_stream,
+    cutoff_time: float,
+    add_language_prefix: bool = True,
+    include_empty_speaker: bool = False,
+):
     """
-    构造 Qwen3-ASR 风格 prefix target。
+    A/B 并行输出，但事件 token 放在 speaker tag 外面。
 
-    核心特点：
-    1. 按 utterance 级别排序，不按 char-level text_stream 排序。
-    2. utterance 内保持完整顺序，不会 A/B 字符交错。
-    3. overlap 时，以 utterance 为原子单位输出：
-       <speaker_A>完整/部分A句子</speaker_A><speaker_B>完整/部分B句子</speaker_B>
-    4. 事件 token 只在 utterance 完成后输出，避免半句话后面直接 <ts>/<te>。
+    输出形式:
+      language Japanese<asr_text>
+      <speaker_A>...</speaker_A><te>
+      <speaker_B>...</speaker_B><pause>
+      <speaker_B>...</speaker_B><te>
     """
 
-    parts = []
+    speaker_pieces = {
+        "A": [],
+        "B": [],
+    }
 
-    if window_start is None:
-        window_start = float("-inf")
-
-    # 关键：按 utterance 起点排序，而不是按 char token end 排序
+    # 按 utterance 原本时间排序；但最后输出时仍然 A track / B track 分开
     utts = sorted(
         utterances,
-        key=lambda u: (
-            float(u["start"]),
-            float(u["end"]),
-            u.get("speaker", ""),
-        ),
+        key=lambda u: (float(u["start"]), float(u["end"]))
     )
 
     for u in utts:
+        speaker = u["speaker"]
+        if speaker not in {"A", "B"}:
+            continue
+
         u_start = float(u["start"])
         u_end = float(u["end"])
 
-        # 这个 utterance 还没开始
-        if u_start > t_now:
+        # 这个 utterance 还没开始，不输出
+        if u_start > cutoff_time:
             continue
 
-        if u_end <= window_start:
-            continue
+        # 已完成 utterance：可以直接用 utterance text，也可以用 text_stream 重建
+        if u_end <= cutoff_time:
+            text = u.get("text", "").strip()
 
-        speaker = u["speaker"]
-        full_text = u.get("text", "").strip()
+            # 如果你更信任 forced alignment 后的 text_stream，也可以换成下面这个：
+            # text = collect_asr_prefix_for_utterance(text_stream, u, cutoff_time)
 
-        if not full_text:
-            continue
+            if text:
+                spk_tag = "speaker_A" if speaker == "A" else "speaker_B"
+                speaker_pieces[speaker].append(
+                    f"<{spk_tag}>{text}</{spk_tag}>"
+                )
 
-        is_finished = u_end <= t_now
-
-        if u_start >= window_start and is_finished:
-            text = full_text
+            # 事件 token 放在 speaker tag 外面
+            suffix = build_event_suffix_from_utterance(u)
+            if suffix:
+                speaker_pieces[speaker].append(suffix)
 
         else:
-            if keep_complete_sentence:
-                # 严格完整句子模式：
-                # 只输出完整落在 [window_start, t_now] 内的 utterance
-                continue
-
-            if not allow_partial_utterance:
-                continue
-
-            text = _partial_text_by_interval(
-                full_text,
-                utt_start=u_start,
-                utt_end=u_end,
-                interval_start=window_start,
-                interval_end=t_now,
+            # 未完成 utterance：只输出当前 cutoff 前已经出现的 ASR prefix，不输出事件
+            text = collect_asr_prefix_for_utterance(
+                text_stream=text_stream,
+                utterance=u,
+                cutoff_time=cutoff_time,
             )
 
-        if not text:
-            continue
+            if text:
+                spk_tag = "speaker_A" if speaker == "A" else "speaker_B"
+                speaker_pieces[speaker].append(
+                    f"<{spk_tag}>{text}</{spk_tag}>"
+                )
 
-        parts.append(_speaker_span(speaker, text))
-        
-        # 事件 token 发生在 utterance 结束处。
-        # 只有 utterance end 在当前窗口内，才输出事件。
-        event_time_in_window = window_start < u_end <= t_now
+    pieces = []
 
-        if event_time_in_window:
-            if is_finished or not add_event_only_when_utterance_finished:
-                parts.append(_event_suffix_from_utterance(u))
+    if add_language_prefix:
+        pieces.append("language Japanese<asr_text>")
 
-    return "".join(parts)
+    if include_empty_speaker or speaker_pieces["A"]:
+        pieces.extend(speaker_pieces["A"])
 
+    if include_empty_speaker or speaker_pieces["B"]:
+        pieces.extend(speaker_pieces["B"])
 
-def build_prefix_sample_times(
-    text_stream,
-    start_time,
-    end_time,
-    *,
-    chunk_secs=DEFAULT_CHUNK_SECS,
-    sample_strategy: Literal["chunk", "event"] = "chunk",
-    max_prefix_samples: Optional[int] = None,
-):
-    """
-    Build prefix sampling times for incremental Qwen3-ASR-style training.
-
-    sample_strategy:
-        "chunk":
-            Sample at fixed time intervals:
-                start + chunk_secs, start + 2 * chunk_secs, ...
-
-        "event":
-            Sample only when output text may change.
-            Namely, use token/event end times from text_stream.
-
-    max_prefix_samples:
-        If not None, uniformly subsample the candidate times.
-    """
-    if end_time <= start_time:
-        return [end_time]
-    
-    if sample_strategy == "chunk":
-        times = []
-        t = start_time + chunk_secs
-
-        while t < end_time:
-            times.append(round(t, 3))
-            t += chunk_secs
-
-        times.append(round(end_time, 3))
-
-    elif sample_strategy == "event":
-        times = sorted({
-            round(float(item["end"]), 3)
-            for item in text_stream
-            if start_time < float(item["end"]) <= end_time
-        })
-
-        # 保证最后一个 prefix 一定覆盖完整音频
-        if not times or abs(times[-1] - end_time) > 1e-3:
-            times.append(round(end_time, 3))
-
-    else:
-        raise ValueError(
-            f"Unknown sample_strategy={sample_strategy!r}. "
-            f"Expected 'chunk' or 'event'."
-        )
-
-    # 去重 + 范围过滤
-    times = sorted({
-        t for t in times
-        if start_time < t <= end_time
-    })
-
-    if max_prefix_samples is not None and len(times) > max_prefix_samples:
-        # 均匀下采样，而不是随机采样，保证覆盖整段对话
-        idxs = np.linspace(
-            0,
-            len(times) - 1,
-            max_prefix_samples,
-        ).round().astype(int)
-
-        times = [times[i] for i in idxs]
-
-        # 再去重一次，防止 round 后 index 重复
-        times = sorted(set(times))
-
-        # 保证最后一个时间点还在
-        if abs(times[-1] - end_time) > 1e-3:
-            times[-1] = round(end_time, 3)
-
-    return times
+    return "".join(pieces)
 
 
-def build_prefix_conversation(audio_list, query="", sr=16000):
-    """
-    Same spirit as build_conversation(), but for SFT prefix mode:
-    only system+user are put in prefix_text; assistant target is returned separately.
-    """
-    MIN_AUDIO_SECS = 0.5
-    min_samples = int(MIN_AUDIO_SECS * sr)
-    conversation = []
-    audio_inputs = []
-
-    for chunk_info in audio_list:
-        a_info = chunk_info["A"]
-        b_info = chunk_info["B"]
-
-        if a_info is not None:
-            start_time = a_info["audio_start"]
-            end_time = a_info["audio_end"]
-        else:
-            start_time = b_info["audio_start"]
-            end_time = b_info["audio_end"]
-
-        if a_info is not None:
-            chunk_a, _, _ = read_audio(a_info)
-            chunk_a = pad_audio_to_min_len(chunk_a, min_samples=min_samples)
-        else:
-            length = max(1, int((end_time - start_time) * sr))
-            chunk_a = make_dummy_audio(length)
-
-        if b_info is not None:
-            chunk_b, _, _ = read_audio(b_info)
-            chunk_b = pad_audio_to_min_len(chunk_b, min_samples=min_samples)
-        else:
-            length = max(1, int((end_time - start_time) * sr))
-            chunk_b = make_dummy_audio(length)
-
-        user_content = [
-            {"type": "audio", "audio": None},
-            {"type": "audio", "audio": None},
-        ]
-
-        audio_inputs.append(chunk_a)
-        audio_inputs.append(chunk_b)
-        conversation.append({"role": "system", "content": query or ""})
-        conversation.append({"role": "user", "content": user_content})
-
-    return conversation, audio_inputs
-
-def pad_audio_to_min_len(wav: torch.Tensor, min_samples: int) -> torch.Tensor:
-    if wav.numel() >= min_samples:
-        return wav
-    pad = make_dummy_audio(min_samples - wav.numel()).to(wav.device)
-    return torch.cat([wav, pad], dim=0)
-
-
-class DualChannelConvStreamingDataset(Dataset):
-    # SYSTEM_PROMPT = (
-    #     "You are a real-time dual-channel meeting transcriber. "
-    #     "For each audio chunk you receive, extend the running transcript "
-    #     "using [A]/[B] speaker tags with <ts> (turn-start) and <te> (turn-end) tokens."
-    # )
-
-    # QUERY = (
-    #     "Transcribe the conversation between the two speakers in real time. "
-    #     "Use [A] and [B] tags, <ts> and <te> tokens."
-    # )
+class IncrementalDualChannelConvDataset(Dataset):
     SYSTEM_PROMPT = ""
-
     QUERY = ""
 
     def __init__(
@@ -453,271 +283,209 @@ class DualChannelConvStreamingDataset(Dataset):
         processor: Optional[AutoProcessor],
         audio_root_a: str,
         audio_root_b: str,
-        sample_rate:  int   = DEFAULT_SAMPLE_RATE,
-        query:        Optional[str] = None,
-        chunk_secs: float = DEFAULT_CHUNK_SECS,
-        prefix_time_strategy: Literal["random", "last", "all"] = "random",
-        sample_strategy: Literal["chunk", "event"] = "chunk",
-        max_prefix_samples_per_record: Optional[int] = None,
-        close_unfinished_speaker: bool = False,
-        non_speech_token: str = NON_SPEECH_TOKEN,
-        max_audio_context_secs: float=30.0
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        query: Optional[str] = None,
+        chunk_secs: float = 1.0,
+        min_audio_secs: float = 0.5,
+        max_context_secs: Optional[float] = None,
+        include_event_times: bool = True,
+        target_mode: str = "cumulative",
     ):
         super().__init__()
 
-        self.processor      = processor
-        self.audio_root_a   = Path(audio_root_a)
-        self.audio_root_b   = Path(audio_root_b)
-        self.sr             = sample_rate
-        self.query          = query or self.QUERY
-        self.chunk_secs     = chunk_secs
-        self.prefix_time_strategy = prefix_time_strategy
-        self.sample_strategy      = sample_strategy
-        self.max_prefix_samples_per_record = max_prefix_samples_per_record
-        self.close_unfinished_speaker = close_unfinished_speaker
-        self.non_speech_token = non_speech_token
-        self.max_audio_context_secs = max_audio_context_secs
-        # ── special token ids for label masking  ──────────────
-        
-        (
-            self.im_start_id,
-            self.assistant_id,
-            self.newline_id,
-            self.im_end_id,
-        ) = processor.tokenizer("<|im_start|>assistant\n<|im_end|>").input_ids
+        assert target_mode in {"cumulative", "delta"}
 
-        # ── build seek-based handle list (same as LiveCC) ────────────────────
-        self.handles: list[tuple[str, int]] = []
+        self.processor = processor
+        self.audio_root_a = Path(audio_root_a)
+        self.audio_root_b = Path(audio_root_b)
+        self.sr = sample_rate
+        self.query = query or self.QUERY
+
+        self.chunk_secs = chunk_secs
+        self.min_audio_secs = min_audio_secs
+        self.max_context_secs = max_context_secs
+        self.include_event_times = include_event_times
+        self.target_mode = target_mode
+
+        self.record_handles = []
         for ap in annotation_paths:
             ap = str(ap)
+
             if ap.endswith(".jsonl"):
-                # last line stores seek indices
                 seeks = json.loads(_read_last_line(ap))
-                self.handles.extend([(ap, sk) for sk in seeks])
-                # logger.warning(f"Loaded {ap} ({len(seeks)} samples)")
+                self.record_handles.extend([(ap, sk) for sk in seeks])
             elif ap.endswith(".json"):
-                # single-record JSON; seek=0 sentinel handled in load_record
-                self.handles.append((ap, -1))
-                logger.warning(f"Loaded single-record {ap}")
+                self.record_handles.append((ap, -1))
             else:
                 raise ValueError(f"Unsupported annotation format: {ap}")
 
-        # Optional full expansion: one dataset item = one prefix time.
-        # Default random keeps the original seek handle structure and samples one prefix per record per epoch.
-        self.prefix_handles: Optional[list[tuple[str, int, float]]] = None
-        if self.prefix_time_strategy == "all":
-            self.prefix_handles = []
-            for path, seek in self.handles:
-                rec = self._load_record_from_handle(path, seek)
-                utts = get_record_utterances(rec)
-                stream = get_record_text_stream(rec)
-                t_start, t_end = get_dialog_time_range(utts, stream)
-                times = build_prefix_sample_times(
-                    stream,
-                    t_start,
-                    t_end,
-                    chunk_secs=self.chunk_secs,
-                    sample_strategy=self.sample_strategy,
-                    max_prefix_samples=self.max_prefix_samples_per_record,
-                )
-                
-                self.prefix_handles.extend((path, seek, t) for t in times)
+        # 这里把 record 展开成多个 prefix sample
+        self.samples = []
+        self._build_samples()
 
-    # ── I/O helpers ──────────────────────────────────────────────────────────
+    def load_record_by_handle(self, handle):
+        path, seek = handle
 
-    def _load_record_from_handle(self, path: str, seek: int) -> dict:
-        if seek == -1:                          # single .json file
+        if seek == -1:
             with open(path, encoding="utf-8") as f:
                 return json.load(f)
+
         with open(path, encoding="utf-8") as f:
             f.seek(seek)
             return json.loads(f.readline())
 
-    def load_record(self, index: int) -> dict:
-        if self.prefix_handles is not None:
-            path, seek, _ = self.prefix_handles[index]
+    def _build_samples(self):
+        for rec_idx, handle in enumerate(self.record_handles):
+            record = self.load_record_by_handle(handle)
+            conv_id, utterances, text_stream = extract_user_parts(record)
+
+            t_start, t_end = get_dialog_time_range(utterances, text_stream)
+
+            cutoff_times = build_cutoff_times(
+                t_start=t_start,
+                t_end=t_end,
+                chunk_secs=self.chunk_secs,
+                include_event_times=self.include_event_times,
+                text_stream=text_stream,
+            )
+
+            prev_cutoff = t_start
+
+            for cutoff in cutoff_times:
+                if cutoff - t_start < self.min_audio_secs:
+                    continue
+
+                self.samples.append({
+                    "rec_idx": rec_idx,
+                    "cutoff": cutoff,
+                    "prev_cutoff": prev_cutoff,
+                })
+
+                prev_cutoff = cutoff
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _resolve_audio_paths(self, conv_id):
+        path_a = self.audio_root_a / f"{conv_id}_a.wav"
+        path_b = self.audio_root_b / f"{conv_id}_b.wav"
+        return path_a, path_b
+
+    def _build_audio_prefix(self, conv_id, t_start, cutoff):
+        path_a, path_b = self._resolve_audio_paths(conv_id)
+
+        if self.max_context_secs is None:
+            audio_start = t_start
         else:
-            path, seek = self.handles[index]
-        return self._load_record_from_handle(path, seek)
-    
-    def _get_audio_window_start(
-        self,
-        *,
-        t_start: float,
-        t_now: float,
-    ) -> float:
-        if t_now <= t_start:
-            t_now = t_start + 1.0 / self.sr
+            audio_start = max(t_start, cutoff - self.max_context_secs)
 
-        return max(t_start, t_now - self.max_audio_context_secs)
+        audio_end = cutoff
 
-    def _resolve_audio_prefix(
-        self,
-        ele: dict,
-        *,
-        t_start: float,
-        t_now: float,
-    ) -> list[dict]:
-        uttr = ele["content"][0]["utterances"]
-        conv_id = ele["content"][1]["id"]
-        speakers = set(u["speaker"] for u in uttr)
-
-        if t_now <= t_start:
-            t_now = t_start + 1.0 / self.sr
-
-        audio_start = self._get_audio_window_start(
-            t_start=t_start,
-            t_now=t_now,
+        chunk_a = read_audio_segment(
+            path_a,
+            audio_start=audio_start,
+            audio_end=audio_end,
+            target_sr=self.sr,
         )
 
-        audio_dict = {
-            "A": {
-                "audio": self.audio_root_a / f"{conv_id}_a.wav",
-                "audio_start": audio_start,
-                "audio_end": t_now,
-            } if "A" in speakers else None,
-            "B": {
-                "audio": self.audio_root_b / f"{conv_id}_b.wav",
-                "audio_start": audio_start,
-                "audio_end": t_now,
-            } if "B" in speakers else None,
-            "utterances": uttr,
-        }
-        return [audio_dict]
-
-    def _select_prefix_time(self, index: int, sample_times: list[float]) -> float:
-        """Pick which prefix time this __getitem__ should return."""
-        if self.prefix_handles is not None:
-            return float(self.prefix_handles[index][2])  # here record is actually dataset index
-        if not sample_times:
-            raise ValueError("no prefix sample times")
-        if self.prefix_time_strategy == "last":
-            return float(sample_times[-1])
-        # default: dynamic random prefix per epoch; keeps original dataset length.
-        return float(random.choice(sample_times))
-    
-    def getitem(self, index: int) -> dict:
-        record = self.load_record(index)
-        user_turn = record[0]
-        utterances = get_record_utterances(record)
-        text_stream = get_record_text_stream(record)
-        t_start, t_end = get_dialog_time_range(utterances, text_stream)
-        
-        sample_times = build_prefix_sample_times(
-            text_stream,
-            t_start,
-            t_end,
-            chunk_secs=self.chunk_secs,
-            sample_strategy=self.sample_strategy,
-            max_prefix_samples=self.max_prefix_samples_per_record,
+        chunk_b = read_audio_segment(
+            path_b,
+            audio_start=audio_start,
+            audio_end=audio_end,
+            target_sr=self.sr,
         )
 
-        t_now = self._select_prefix_time(index=index, sample_times=sample_times)
+        total_samples = max(len(chunk_a), len(chunk_b))
 
-        utterances = record[0]["content"][0]["utterances"]
+        if len(chunk_a) < total_samples:
+            chunk_a = torch.nn.functional.pad(
+                chunk_a,
+                (0, total_samples - len(chunk_a)),
+            )
 
-        audio_window_start = self._get_audio_window_start(
-            t_start=t_start,
-            t_now=t_now,
-        )
+        if len(chunk_b) < total_samples:
+            chunk_b = torch.nn.functional.pad(
+                chunk_b,
+                (0, total_samples - len(chunk_b)),
+            )
 
-        target_body = build_prefix_target_from_utterances(
-            utterances=utterances,
-            t_now=t_now,
-            window_start=audio_window_start,
-            allow_partial_utterance=True,
-            keep_complete_sentence=False,
-        )
+        return chunk_a, chunk_b, audio_start, audio_end
 
-        # If this fixed chunk introduces no new transcript/event, append one action token.
-        # This makes the sample explicitly teach "no new speech output now" without accumulating
-        # infinite <non_speech><non_speech>... in the transcript history.
+    def _build_conversation_prefix(self):
+        conversation = [
+            {"role": "system", "content": self.query or ""},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio", "audio": None},
+                    {"type": "audio", "audio": None},
+                ],
+            },
+        ]
 
-        audio_list = self._resolve_audio_prefix(
-            user_turn,
-            t_start=t_start,
-            t_now=t_now,
-        )
-
-        conversation, audio_inputs = build_prefix_conversation(
-            audio_list,
-            query=self.query,
-            sr=self.sr,
-        )
-
-        target_text = "language Japanese<asr_text>" + target_body
         prefix_text = self.processor.apply_chat_template(
             conversation,
             tokenize=False,
             add_generation_prompt=True,
         )
 
+        return prefix_text
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+
+        handle = self.record_handles[sample["rec_idx"]]
+        record = self.load_record_by_handle(handle)
+
+        conv_id, utterances, text_stream = extract_user_parts(record)
+        t_start, t_end = get_dialog_time_range(utterances, text_stream)
+
+        cutoff = sample["cutoff"]
+        prev_cutoff = sample["prev_cutoff"]
+
+        chunk_a, chunk_b, audio_start, audio_end = self._build_audio_prefix(
+            conv_id=conv_id,
+            t_start=t_start,
+            cutoff=cutoff,
+        )
+
+        if self.target_mode == "cumulative":
+            target_text = build_parallel_utterance_prefix_target(
+                utterances=utterances,
+                text_stream=text_stream,
+                cutoff_time=cutoff,
+                add_language_prefix=True,
+            )
+        else:
+            # delta 模式：只输出上一个 cutoff 到当前 cutoff 之间新增的 token
+            delta_stream = [
+                x for x in text_stream
+                if prev_cutoff < float(x["end"]) <= cutoff
+            ]
+
+            target_text = build_parallel_utterance_prefix_target(
+                utterances=utterances,
+                text_stream=delta_stream,
+                cutoff_time=cutoff,
+                add_language_prefix=True,
+            )
+
+        prefix_text = self._build_conversation_prefix()
+
         return {
             "prompt": self.query,
             "prefix_text": prefix_text,
             "target": target_text,
-            "audios": [a.numpy() for a in audio_inputs],
-            "audio_start": t_start,
-            "audio_end": t_now,
-            "target_body": target_body,
-            "audio_list": audio_list,
+            "audios": [
+                chunk_a.numpy(),
+                chunk_b.numpy(),
+            ],
+            "conv_id": conv_id,
+            "cutoff": cutoff,
+            "audio_start": audio_start,
+            "audio_end": audio_end,
         }
-
-    def __len__(self) -> int:
-        if self.prefix_handles is not None:
-            return len(self.prefix_handles)
-        return len(self.handles)
-
-    def __getitem__(self, index: int) -> dict:
-        return self.getitem(index)
-        # max_tries = 10
-        # for _ in range(max_tries):
-        #     try:
-        #         return self.getitem(index)
-        #     except Exception as e:
-        #         logger.warning(f"Failed {_}-th try to get item {index}: {e}")
-        #         index = random.randint(0, self.__len__() - 1)
-        #         logger.warning(f"Retrying to get item {index}")
-        # raise Exception(f"Failed to get item after {max_tries} retries")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Utility: read last line efficiently (mirror LiveCC's readlastline)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _read_last_line(path: str, buf: int = 4096) -> str:
-    with open(path, "rb") as f:
-        f.seek(0, 2)
-        size = f.tell()
-        pos, last = size, b""
-        while pos > 0:
-            read_sz = min(buf, pos)
-            pos -= read_sz
-            f.seek(pos)
-            chunk = f.read(read_sz)
-            lines = (chunk + last).split(b"\n")
-            last  = lines[0]
-            non_empty = [l for l in lines[1:] if l.strip()]
-            if non_empty:
-                return non_empty[-1].decode("utf-8")
-    return last.decode("utf-8")
-
-
-def record_display(record: dict):
-    print("=== Utterances ===")
-    for u in record[0]["content"][0]["utterances"]:
-        flag = " ← TURN-TAKING" if u["is_turn_taking"] else ""
-        print(f"  [{u['speaker']}] {u['start']:.2f}-{u['end']:.2f}  {u['text']}{flag}")
-
-    print("\n=== Stream (first 20 events) ===")
-    for ev in record[1]["content"][0]["text_stream"]:
-        print(f"  {ev['start']:.3f} {ev['end']:.3f}  [{ev['speaker']}]  {ev['token']:6s}  ({ev['kind']})")
-    print("\n=== Training sequence ===")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Smoke-test
-# ─────────────────────────────────────────────────────────────────────────────
-
+    
 if __name__ == "__main__":
     import logging
     from collator import DataCollatorForDualChannelQwen3ASRFinetuning
@@ -756,7 +524,7 @@ if __name__ == "__main__":
     
     logger = setup_logger("debug.log")
     
-    dir = "/ctd/Works/m-wu/Datasets/zoom2025/finetune_labels/l10_conv_train_with_backchannel"
+    dir = "/ctd/Works/m-wu/Datasets/zoom2025/finetune_labels/l3_conv_train_with_backchannel"
 
     asr_wrapper = Qwen3ASRModel.from_pretrained(
         "Qwen/Qwen3-ASR-1.7B",
@@ -771,7 +539,6 @@ if __name__ == "__main__":
         BC_TOKEN,
         PAUSE_TOKEN,
         SILENCE_TOKEN,
-        NON_SPEECH_TOKEN,
         SPEAKER_TOKENS["A"][0],
         SPEAKER_TOKENS["A"][1],
         SPEAKER_TOKENS["B"][0],
@@ -794,21 +561,21 @@ Use special tokens to represent dialogue events:
 
 Output the transcript in chronological order."""
     
-    ds = DualChannelConvStreamingDataset(
+    ds = IncrementalDualChannelConvDataset(
         annotation_paths=[str(path) for path in Path(dir).glob("*.jsonl")],
         processor=processor,
         audio_root_a="/ctd/Works/m-wu/Datasets/zoom2025/audios/A_gd",
         audio_root_b="/ctd/Works/m-wu/Datasets/zoom2025/audios/B_gd",
         query=query,
-        sample_strategy="event",
-        prefix_time_strategy="all",
-        max_audio_context_secs=60.0
+        chunk_secs=1,
+        min_audio_secs=0.5,
     )
     print(f"Dataset length: {len(ds)}")
     collator = DataCollatorForDualChannelQwen3ASRFinetuning(processor)
-    loader = DataLoader(ds, batch_size=1, shuffle=False, collate_fn=collator)
+    loader = DataLoader(ds, batch_size=4, num_workers=16, shuffle=False, collate_fn=collator)
     max_size = 0
     for batch in tqdm.tqdm(loader):
+        
         if batch['input_features'].size(2) > max_size:
             max_size = batch['input_features'].size(2)
         if batch['input_features'].size(2) > 3000:
@@ -816,9 +583,9 @@ Output the transcript in chronological order."""
             breakpoint()
         logger.info(f"target_texts: {batch['target_texts']}")
         logger.info(f"num input features: {batch['input_features'].size()}")
-        logger.info(f"attention mask size: {batch['attention_mask'].size()}")
-        logger.info(f"feature attention mask size: {batch['feature_attention_mask'].size()}")
-        logger.info(f"input ids size:{batch['input_ids'].size()}")
+        logger.info(f"attention mask size: {batch["attention_mask"].size()}")
+        logger.info(f"feature attention mask size: {batch["feature_attention_mask"].size()}")
+        logger.info(f"input ids size:{batch["input_ids"].size()}")
         logger.info(f"labels size: {batch['labels'].size()}")
         input_ids = batch["input_ids"]
         input_ids = processor.batch_decode(input_ids, skip_special_tokens=False)

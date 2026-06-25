@@ -1,9 +1,11 @@
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-torchrun --nproc_per_node=4 train.py \
+export CUDA_VISIBLE_DEVICES=0,1
+torchrun \
+  --master_port=29501 \
+  --nproc_per_node=2 train.py \
   --deepspeed ./scripts/zero2.json \
   --model_path Qwen/Qwen3-ASR-1.7B \
   --data_version "nonstreaming" \
-  --data_dir /ctd/Works/m-wu/Datasets/zoom2025/finetune_labels/l5_conv_train_with_backchannel \
+  --data_dir /ctd/Works/m-wu/Datasets/zoom2025/finetune_labels/l3_conv_train_with_backchannel \
   --audio_root_a "/ctd/Works/m-wu/Datasets/zoom2025/audios/A_gd" \
   --audio_root_b "/ctd/Works/m-wu/Datasets/zoom2025/audios/B_gd" \
   --output_dir /ctd/Works/m-wu/Models/StreamingSpeechLLM_with_pos/ASR_CONV_finetune/qwen3-asr-lora16-l3 \
@@ -12,10 +14,11 @@ torchrun --nproc_per_node=4 train.py \
   --lora_alpha 32 \
   --lora_dropout 0.05 \
   --lora_target_modules q_proj,k_proj,v_proj,o_proj \
-  --batch_size 8 \
-  --grad_acc 2 \
+  --freeze_audio_tower true \
+  --batch_size 4 \
+  --grad_acc 1 \
   --lr 2e-5 \
   --epochs 4 \
-  --save_steps 1000 \
+  --save_steps 500 \
   --report_to tensorboard \
   --resume 1

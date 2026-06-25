@@ -136,9 +136,43 @@ def maybe_enable_lora(model, args_cli):
         lora_dropout=args_cli.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
+        modules_to_save=["audio_channel_embed"],
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+    return model
+
+def freeze_audio_tower(model):
+    """
+    Freeze Qwen3-ASR audio tower / audio encoder parameters.
+
+    This function is intentionally a bit defensive because different
+    Qwen3-ASR wrappers may use slightly different attribute names.
+    """
+
+    candidate_names = [
+        "audio_tower",
+    ]
+
+    frozen = []
+
+    # 常见情况：audio module 在 model.thinker 下面
+    if hasattr(model.base_model, "thinker"):
+        for name in candidate_names:
+            if hasattr(model.base_model.thinker, name):
+                module = getattr(model.base_model.thinker, name)
+                for p in module.parameters():
+                    p.requires_grad = False
+                frozen.append(f"thinker.{name}")
+
+    if len(frozen) == 0:
+        print("[warn] No audio tower module found to freeze.")
+        print("[warn] Please check model.named_modules() for the correct audio module name.")
+    else:
+        print("[info] Frozen audio modules:")
+        for name in frozen:
+            print(f"  - {name}")
+
     return model
 
 
@@ -153,7 +187,6 @@ def parse_args():
     p.add_argument("--audio_root_a", type=str, default="/n/work6/yizhang/Moris/zoom2025/audios/A_gd")
     p.add_argument("--audio_root_b", type=str, default="/n/work6/yizhang/Moris/zoom2025/audios/B_gd")
     
-
     # Audio
     p.add_argument("--sr", type=int, default=16000)
 
@@ -179,6 +212,7 @@ def parse_args():
         default="q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
         help="Comma-separated module names to apply LoRA to.",
     )
+    p.add_argument("--freeze_audio_tower", type=bool, default=False)
     
     # DataLoader
     p.add_argument("--num_workers", type=int, default=4)
@@ -191,6 +225,8 @@ def parse_args():
         choices=["nonstreaming", "streaming"],
         default="nonstreaming"
     )
+    p.add_argument("--use_pos_emb", type=bool, default=False)
+    p.add_argument("--use_channel_emb", type=bool, default=False)
 
     # Save
     p.add_argument("--save_strategy", type=str, default="steps")
@@ -224,7 +260,8 @@ def make_dialogue_module(processor,
                 audio_root_b=data_args.audio_root_b,
                 query=query,
                 sample_strategy="event",
-                prefix_time_strategy="all"
+                prefix_time_strategy="all",
+                max_audio_context_secs=60.0
             )
         else:
             raise ValueError("Invalid data_args.data_version")
@@ -248,7 +285,8 @@ def make_dialogue_module(processor,
                 audio_root_b=data_args.audio_root_b,
                 query=query,
                 sample_strategy="event",
-                prefix_time_strategy="all"
+                prefix_time_strategy="all",
+                max_audio_context_secs=60.0
             )
         else:
             raise ValueError("Invalid data_args.data_version")
@@ -303,15 +341,22 @@ def main():
 
         Output the transcript in chronological order."""
     
-    hidden_size = model.thinker.config.text_config.hidden_size
-    model.thinker.audio_channel_embed = torch.nn.Embedding(2, hidden_size).to(
-        next(model.thinker.parameters()).device
-    )
-    model.thinker.forward = MethodType(dual_channel_forward, model.thinker)
+    if args_cli.use_channel_emb:
+        hidden_size = model.thinker.config.text_config.hidden_size
+        model.thinker.audio_channel_embed = torch.nn.Embedding(2, hidden_size).to(
+            next(model.thinker.parameters()).device
+        )
+        
+        model.thinker.forward = MethodType(dual_channel_forward, model.thinker)
+        
     patch_outer_forward(model)
     
     model = maybe_enable_lora(model, args_cli)
     
+    if args_cli.freeze_audio_tower:
+        model = freeze_audio_tower(model)
+        model.print_trainable_parameters()
+
     model.generation_config = GenerationConfig.from_model_config(model.config)
 
     data_module = make_dialogue_module(processor, args_cli, query)

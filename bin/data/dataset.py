@@ -10,6 +10,7 @@ import librosa
 import torch
 from torch.utils.data import Dataset
 from transformers import AutoProcessor, logging
+
 import sys
 sys.path.append("../")
 from constants import (TS_TOKEN, TE_TOKEN, BC_TOKEN, PAUSE_TOKEN, SILENCE_TOKEN,
@@ -275,12 +276,13 @@ class DualChannelConvDataset(Dataset):
     def getitem(self, index: int) -> dict:
         record = self.load_record(index)
         audio_list = self._resolve_audio(record[0])
-
+        conv_id = record[0]["content"][1]["id"]
         conversation, audio_inputs = build_conversation(
             audio_list,
             query=self.query,
             sr=self.sr,
         )
+
 
         # 只保留 user 部分作为 prefix
         target_text = "language Japanese<asr_text>"+conversation[-1]["content"]
@@ -292,6 +294,7 @@ class DualChannelConvDataset(Dataset):
         )
         
         return {
+            "conv_id": conv_id,
             "prompt": self.query,
             "prefix_text": prefix_text,
             "target": target_text,
@@ -337,19 +340,6 @@ def _read_last_line(path: str, buf: int = 4096) -> str:
             if non_empty:
                 return non_empty[-1].decode("utf-8")
     return last.decode("utf-8")
-
-
-def record_display(record: dict):
-    print("=== Utterances ===")
-    for u in record[0]["content"][0]["utterances"]:
-        flag = " ← TURN-TAKING" if u["is_turn_taking"] else ""
-        print(f"  [{u['speaker']}] {u['start']:.2f}-{u['end']:.2f}  {u['text']}{flag}")
-
-    print("\n=== Stream (first 20 events) ===")
-    for ev in record[1]["content"][0]["text_stream"]:
-        print(f"  {ev['start']:.3f} {ev['end']:.3f}  [{ev['speaker']}]  {ev['token']:6s}  ({ev['kind']})")
-    print("\n=== Training sequence ===")
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Smoke-test
 # ─────────────────────────────────────────────────────────────────────────────
@@ -392,7 +382,7 @@ if __name__ == "__main__":
     
     logger = setup_logger("debug.log")
     
-    dir = "/ctd/Works/m-wu/Datasets/zoom2025/finetune_labels/l10_conv_train_with_backchannel"
+    dir = "/ctd/Works/m-wu/Datasets/zoom2025/finetune_labels/l3_conv_train_with_backchannel"
 
     asr_wrapper = Qwen3ASRModel.from_pretrained(
         "Qwen/Qwen3-ASR-1.7B",
@@ -437,16 +427,19 @@ Output the transcript in chronological order."""
         query=query
     )
     print(f"Dataset length: {len(ds)}")
-    collator = DataCollatorForDualChannelQwen3ASRFinetuning(processor)
-    loader = DataLoader(ds, batch_size=1, shuffle=True, collate_fn=collator)
+    collator = DataCollatorForDualChannelQwen3ASRFinetuning(processor=processor,
+                                                            use_pos_emb=False,
+                                                            use_channel_emb=False)
+    loader = DataLoader(ds, batch_size=4, num_workers=16, shuffle=True, collate_fn=collator)
     max_size = 0
     for batch in tqdm.tqdm(loader):
-        
+        breakpoint()
         if batch['input_features'].size(2) > max_size:
             max_size = batch['input_features'].size(2)
-        if batch['input_features'].size(2) > 2000:
+        if batch['input_features'].size(2) > 3000:
             print(max_size)
             breakpoint()
+        logger.info(f"target_texts: {batch['target_texts']}")
         logger.info(f"num input features: {batch['input_features'].size()}")
         logger.info(f"attention mask size: {batch["attention_mask"].size()}")
         logger.info(f"feature attention mask size: {batch["feature_attention_mask"].size()}")
