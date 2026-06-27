@@ -3,3 +3,5 @@ __pycache__
 *.jsonl
 *.json
 Qwen3-ASR
+*.wav
+*.txt

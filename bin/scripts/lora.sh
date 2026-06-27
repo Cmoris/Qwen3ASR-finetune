@@ -5,10 +5,10 @@ torchrun \
   --deepspeed ./scripts/zero2.json \
   --model_path Qwen/Qwen3-ASR-1.7B \
   --data_version "nonstreaming" \
-  --data_dir /ctd/Works/m-wu/Datasets/zoom2025/finetune_labels/l3_conv_train_with_backchannel \
+  --data_dir /ctd/Works/m-wu/Datasets/zoom2025/finetune_labels/l3_conv_train_with_backchannel_overlap \
   --audio_root_a "/ctd/Works/m-wu/Datasets/zoom2025/audios/A_gd" \
   --audio_root_b "/ctd/Works/m-wu/Datasets/zoom2025/audios/B_gd" \
-  --output_dir /ctd/Works/m-wu/Models/StreamingSpeechLLM_with_pos/ASR_CONV_finetune/qwen3-asr-lora16-l3 \
+  --output_dir /ctd/Works/m-wu/Models/StreamingSpeechLLM/ASR_CONV_finetune/qwen3-asr-lora16-l3-overlap \
   --lora_enable true \
   --lora_r 16 \
   --lora_alpha 32 \

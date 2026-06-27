@@ -16,7 +16,7 @@ sys.path.append("../")
 from constants import (
     TS_TOKEN, TE_TOKEN, BC_TOKEN, PAUSE_TOKEN, SILENCE_TOKEN,
     SPEAKER_TOKENS, STREAMING_CONT,
-    DEFAULT_CHUNK_SECS, DEFAULT_SAMPLE_RATE, DEFAULT_CONTEXT_LENGTH,
+    DEFAULT_CHUNK_SECS, DEFAULT_SAMPLE_RATE
 )
 
 
@@ -340,7 +340,7 @@ class IncrementalDualChannelConvDataset(Dataset):
             conv_id, utterances, text_stream = extract_user_parts(record)
 
             t_start, t_end = get_dialog_time_range(utterances, text_stream)
-
+        
             cutoff_times = build_cutoff_times(
                 t_start=t_start,
                 t_end=t_end,
@@ -442,7 +442,7 @@ class IncrementalDualChannelConvDataset(Dataset):
 
         cutoff = sample["cutoff"]
         prev_cutoff = sample["prev_cutoff"]
-
+        breakpoint()
         chunk_a, chunk_b, audio_start, audio_end = self._build_audio_prefix(
             conv_id=conv_id,
             t_start=t_start,
@@ -485,7 +485,136 @@ class IncrementalDualChannelConvDataset(Dataset):
             "audio_start": audio_start,
             "audio_end": audio_end,
         }
-    
+
+
+def save_dataset_samples_for_inspection(
+    dataset: Dataset,
+    output_dir: str | Path,
+    num_samples: int = 10,
+    start_index: int = 0,
+    save_stereo: bool = True,
+) -> list[Path]:
+    """
+    保存若干数据集输出，便于人工检查音频与 target 是否匹配。
+
+    每个样本保存为独立目录，其中包含：
+      - ``speaker_A.wav``：A 通道
+      - ``speaker_B.wav``：B 通道
+      - ``stereo_AB.wav``：可选；左声道 A、右声道 B
+      - ``target.txt``：对应的 target text
+      - ``metadata.json``：样本索引、会话 ID 和时间范围
+
+    Args:
+        dataset: ``IncrementalDualChannelConvDataset`` 或具有相同输出格式的数据集。
+        output_dir: 检查结果的保存目录。
+        num_samples: 从 ``start_index`` 开始保存的样本数。
+        start_index: 第一个待保存的 dataset index。
+        save_stereo: 是否额外保存便于双耳监听的双声道音频。
+
+    Returns:
+        实际创建的样本目录列表。
+    """
+    if num_samples < 0:
+        raise ValueError(f"num_samples must be >= 0, got {num_samples}")
+    if start_index < 0:
+        raise ValueError(f"start_index must be >= 0, got {start_index}")
+    if start_index > len(dataset):
+        raise IndexError(
+            f"start_index {start_index} exceeds dataset length {len(dataset)}"
+        )
+    sample_rate = getattr(dataset, "sr", None)
+    if not isinstance(sample_rate, int) or sample_rate <= 0:
+        raise ValueError(
+            f"dataset.sr must be a positive integer, got {sample_rate!r}"
+        )
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    end_index = min(start_index + num_samples, len(dataset))
+    saved_dirs = []
+
+    for index in range(start_index, end_index):
+        sample = dataset[index]
+        audios = sample.get("audios")
+        if not isinstance(audios, (list, tuple)) or len(audios) != 2:
+            raise ValueError(
+                f"sample {index} must contain two audio channels in 'audios'"
+            )
+
+        channels = []
+        for speaker, audio in zip(("A", "B"), audios):
+            if isinstance(audio, torch.Tensor):
+                audio = audio.detach().cpu().float().numpy()
+            else:
+                audio = np.asarray(audio, dtype=np.float32)
+
+            audio = np.squeeze(audio)
+            if audio.ndim != 1:
+                raise ValueError(
+                    f"sample {index} speaker {speaker} audio must be mono, "
+                    f"got shape {audio.shape}"
+                )
+            if audio.size == 0:
+                raise ValueError(
+                    f"sample {index} speaker {speaker} audio is empty"
+                )
+            if not np.isfinite(audio).all():
+                raise ValueError(
+                    f"sample {index} speaker {speaker} audio contains NaN or Inf"
+                )
+            channels.append(audio.astype(np.float32, copy=False))
+
+        target = sample.get("target")
+        if not isinstance(target, str):
+            raise TypeError(
+                f"sample {index} 'target' must be str, got {type(target).__name__}"
+            )
+
+        conv_id = str(sample.get("conv_id", "unknown"))
+        safe_conv_id = "".join(
+            char if char.isalnum() or char in "-_." else "_"
+            for char in conv_id
+        )
+        sample_dir = output_dir / (
+            f"sample_{index:06d}_{safe_conv_id}_"
+            f"{float(sample.get('audio_start', 0.0)):.3f}-"
+            f"{float(sample.get('audio_end', 0.0)):.3f}"
+        )
+        sample_dir.mkdir(parents=True, exist_ok=True)
+
+        max_length = max(len(channels[0]), len(channels[1]))
+        padded_channels = [
+            np.pad(audio, (0, max_length - len(audio)))
+            for audio in channels
+        ]
+
+        sf.write(sample_dir / "speaker_A.wav", padded_channels[0], sample_rate)
+        sf.write(sample_dir / "speaker_B.wav", padded_channels[1], sample_rate)
+        if save_stereo:
+            stereo = np.stack(padded_channels, axis=1)
+            sf.write(sample_dir / "stereo_AB.wav", stereo, sample_rate)
+
+        (sample_dir / "target.txt").write_text(target, encoding="utf-8")
+
+        metadata = {
+            "dataset_index": index,
+            "conv_id": conv_id,
+            "cutoff": sample.get("cutoff"),
+            "audio_start": sample.get("audio_start"),
+            "audio_end": sample.get("audio_end"),
+            "sample_rate": sample_rate,
+            "num_samples": max_length,
+            "duration_seconds": max_length / sample_rate,
+            "target": target,
+        }
+        with open(sample_dir / "metadata.json", "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+        saved_dirs.append(sample_dir)
+
+    return saved_dirs
+
+
 if __name__ == "__main__":
     import logging
     from collator import DataCollatorForDualChannelQwen3ASRFinetuning
@@ -570,8 +699,19 @@ Output the transcript in chronological order."""
         chunk_secs=1,
         min_audio_secs=0.5,
     )
+
+    saved_dirs = save_dataset_samples_for_inspection(
+        dataset=ds,
+        output_dir="debug_streaming_samples",
+        num_samples=10,
+        start_index=0,
+    )
+    print(saved_dirs)
+
     print(f"Dataset length: {len(ds)}")
-    collator = DataCollatorForDualChannelQwen3ASRFinetuning(processor)
+    collator = DataCollatorForDualChannelQwen3ASRFinetuning(processor=processor,
+                                                            use_channel_emb=False,
+                                                            use_pos_emb=False)
     loader = DataLoader(ds, batch_size=4, num_workers=16, shuffle=False, collate_fn=collator)
     max_size = 0
     for batch in tqdm.tqdm(loader):

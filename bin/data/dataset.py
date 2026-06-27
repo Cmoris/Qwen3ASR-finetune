@@ -14,7 +14,7 @@ from transformers import AutoProcessor, logging
 import sys
 sys.path.append("../")
 from constants import (TS_TOKEN, TE_TOKEN, BC_TOKEN, PAUSE_TOKEN, SILENCE_TOKEN,
-                       SPEAKER_TOKENS, STREAMING_CONT, DEFAULT_CHUNK_SECS, DEFAULT_SAMPLE_RATE, DEFAULT_CONTEXT_LENGTH)
+                       SPEAKER_TOKENS, STREAMING_CONT, DEFAULT_CHUNK_SECS, DEFAULT_SAMPLE_RATE)
 
 # logger = logging.get_logger(__name__)
 
@@ -320,6 +320,130 @@ class DualChannelConvDataset(Dataset):
         # raise Exception(f"Failed to get item after {max_tries} retries")
 
 
+def save_dataset_samples_for_inspection(
+    dataset: Dataset,
+    output_dir: str | Path,
+    num_samples: int = 10,
+    start_index: int = 0,
+    save_stereo: bool = True,
+) -> list[Path]:
+    """
+    保存若干 ``DualChannelConvDataset`` 输出，便于检查音频与 target。
+
+    每个样本目录包含 A/B 单声道音频、可选的 AB 双声道音频、
+    target 文本，以及记录原始音频路径和裁剪时间的 metadata。
+    """
+    if num_samples < 0:
+        raise ValueError(f"num_samples must be >= 0, got {num_samples}")
+    if start_index < 0:
+        raise ValueError(f"start_index must be >= 0, got {start_index}")
+    if start_index > len(dataset):
+        raise IndexError(
+            f"start_index {start_index} exceeds dataset length {len(dataset)}"
+        )
+
+    sample_rate = getattr(dataset, "sr", None)
+    if not isinstance(sample_rate, int) or sample_rate <= 0:
+        raise ValueError(
+            f"dataset.sr must be a positive integer, got {sample_rate!r}"
+        )
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    end_index = min(start_index + num_samples, len(dataset))
+    saved_dirs = []
+
+    for index in range(start_index, end_index):
+        sample = dataset[index]
+        audios = sample.get("audios")
+        if not isinstance(audios, (list, tuple)) or len(audios) != 2:
+            raise ValueError(
+                f"sample {index} must contain two audio channels in 'audios'"
+            )
+
+        channels = []
+        for speaker, audio in zip(("A", "B"), audios):
+            if isinstance(audio, torch.Tensor):
+                audio = audio.detach().cpu().float().numpy()
+            else:
+                audio = np.asarray(audio, dtype=np.float32)
+
+            audio = np.squeeze(audio)
+            if audio.ndim != 1:
+                raise ValueError(
+                    f"sample {index} speaker {speaker} audio must be mono, "
+                    f"got shape {audio.shape}"
+                )
+            if audio.size == 0:
+                raise ValueError(
+                    f"sample {index} speaker {speaker} audio is empty"
+                )
+            if not np.isfinite(audio).all():
+                raise ValueError(
+                    f"sample {index} speaker {speaker} audio contains NaN or Inf"
+                )
+            channels.append(audio.astype(np.float32, copy=False))
+
+        target = sample.get("target")
+        if not isinstance(target, str):
+            raise TypeError(
+                f"sample {index} 'target' must be str, got {type(target).__name__}"
+            )
+
+        conv_id = str(sample.get("conv_id", "unknown"))
+        safe_conv_id = "".join(
+            char if char.isalnum() or char in "-_." else "_"
+            for char in conv_id
+        )
+        sample_dir = output_dir / f"sample_{index:06d}_{safe_conv_id}"
+        sample_dir.mkdir(parents=True, exist_ok=True)
+
+        max_length = max(len(channels[0]), len(channels[1]))
+        padded_channels = [
+            np.pad(audio, (0, max_length - len(audio)))
+            for audio in channels
+        ]
+
+        sf.write(sample_dir / "speaker_A.wav", padded_channels[0], sample_rate)
+        sf.write(sample_dir / "speaker_B.wav", padded_channels[1], sample_rate)
+        if save_stereo:
+            stereo = np.stack(padded_channels, axis=1)
+            sf.write(sample_dir / "stereo_AB.wav", stereo, sample_rate)
+
+        (sample_dir / "target.txt").write_text(target, encoding="utf-8")
+
+        audio_info = {}
+        audio_list = sample.get("audio_list")
+        if isinstance(audio_list, list) and audio_list:
+            chunk_info = audio_list[0]
+            for speaker in ("A", "B"):
+                speaker_info = chunk_info.get(speaker)
+                if speaker_info is None:
+                    audio_info[speaker] = None
+                else:
+                    audio_info[speaker] = {
+                        "path": str(speaker_info.get("audio", "")),
+                        "audio_start": speaker_info.get("audio_start"),
+                        "audio_end": speaker_info.get("audio_end"),
+                    }
+
+        metadata = {
+            "dataset_index": index,
+            "conv_id": conv_id,
+            "sample_rate": sample_rate,
+            "num_samples": max_length,
+            "duration_seconds": max_length / sample_rate,
+            "audio_info": audio_info,
+            "target": target,
+        }
+        with open(sample_dir / "metadata.json", "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+        saved_dirs.append(sample_dir)
+
+    return saved_dirs
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Utility: read last line efficiently (mirror LiveCC's readlastline)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -426,6 +550,14 @@ Output the transcript in chronological order."""
         audio_root_b="/ctd/Works/m-wu/Datasets/zoom2025/audios/B_gd",
         query=query
     )
+
+    saved_dirs = save_dataset_samples_for_inspection(
+        dataset=ds,
+        output_dir="debug_dataset_samples",
+        num_samples=10,
+        start_index=0,
+    )
+
     print(f"Dataset length: {len(ds)}")
     collator = DataCollatorForDualChannelQwen3ASRFinetuning(processor=processor,
                                                             use_pos_emb=False,

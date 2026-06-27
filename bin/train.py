@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import re
 import shutil
@@ -14,12 +15,12 @@ from transformers import (GenerationConfig, Trainer, TrainerCallback,
 from peft import LoraConfig, get_peft_model
 
 from data.dataset import DualChannelConvDataset
-from data.streaming_dataset import DualChannelConvStreamingDataset
+from data.streaming_dataset import IncrementalDualChannelConvDataset
 from data.collator import DataCollatorForDualChannelQwen3ASRFinetuning
 
 from inference import dual_channel_forward
 from constants import (TS_TOKEN, TE_TOKEN, BC_TOKEN, PAUSE_TOKEN, SILENCE_TOKEN,
-                       SPEAKER_TOKENS)
+                       SPEAKER_TOKENS, DEFAULT_CHUNK_SECS)
 
 
 
@@ -200,6 +201,8 @@ def parse_args():
     p.add_argument("--warmup_ratio", type=float, default=0.02)
     p.add_argument("--deepspeed", type=str, default=None)
     p.add_argument("--report_to", type=str, default=None)
+    p.add_argument("--use_pos_emb", action='store_true')
+    p.add_argument("--use_channel_emb", action='store_true')
     # LoRA / PEFT
     p.add_argument("--lora_enable", type=bool, default=False)
     p.add_argument("--lora_r", type=int, default=16)
@@ -219,14 +222,13 @@ def parse_args():
     p.add_argument("--pin_memory", type=int, default=1)
     p.add_argument("--persistent_workers", type=int, default=1)
     p.add_argument("--prefetch_factor", type=int, default=2)
+    p.add_argument("--chunk_secs", type=int, default=DEFAULT_CHUNK_SECS)
     p.add_argument(
         "--data_version",
         type=str,
         choices=["nonstreaming", "streaming"],
         default="nonstreaming"
     )
-    p.add_argument("--use_pos_emb", type=bool, default=False)
-    p.add_argument("--use_channel_emb", type=bool, default=False)
 
     # Save
     p.add_argument("--save_strategy", type=str, default="steps")
@@ -253,15 +255,13 @@ def make_dialogue_module(processor,
                 query=query
             )
         elif data_args.data_version == "streaming":
-            train_dataset = DualChannelConvStreamingDataset(
+            train_dataset = IncrementalDualChannelConvDataset(
                 annotation_paths=[str(path) for path in Path(data_args.data_dir).glob("*.jsonl")],
                 processor=processor,
                 audio_root_a=data_args.audio_root_a,
                 audio_root_b=data_args.audio_root_b,
-                query=query,
-                sample_strategy="event",
-                prefix_time_strategy="all",
-                max_audio_context_secs=60.0
+                chunk_secs=data_args.chunk_secs,
+                min_audio_secs=0.5,
             )
         else:
             raise ValueError("Invalid data_args.data_version")
@@ -278,22 +278,22 @@ def make_dialogue_module(processor,
                 query=query
             )
         elif data_args.data_version == "streaming":
-            validate_dataset = DualChannelConvStreamingDataset(
+            validate_dataset = IncrementalDualChannelConvDataset(
                 annotation_paths=[str(path) for path in Path(data_args.validate_dir).glob("*.jsonl")],
                 processor=processor,
                 audio_root_a=data_args.audio_root_a,
                 audio_root_b=data_args.audio_root_b,
-                query=query,
-                sample_strategy="event",
-                prefix_time_strategy="all",
-                max_audio_context_secs=60.0
+                chunk_secs=data_args.chunk_secs,
+                min_audio_secs=0.5,
             )
         else:
             raise ValueError("Invalid data_args.data_version")
     else:
         validate_dataset = None
     
-    data_collator = DataCollatorForDualChannelQwen3ASRFinetuning(processor)
+    data_collator = DataCollatorForDualChannelQwen3ASRFinetuning(processor=processor,
+                                                                 use_channel_emb=data_args.use_channel_emb,
+                                                                 use_pos_emb=data_args.use_pos_emb)
     
     return dict(train_dataset=train_dataset,
                 eval_dataset=validate_dataset,
@@ -388,6 +388,12 @@ def main():
         report_to=args_cli.report_to,
             deepspeed=args_cli.deepspeed
     )
+
+    if training_args.process_index == 0:
+        os.makedirs(args_cli.output_dir, exist_ok=True)
+        args_path = os.path.join(args_cli.output_dir, "args.json")
+        with open(args_path, "w", encoding="utf-8") as f:
+            json.dump(vars(args_cli), f, ensure_ascii=False, indent=2, sort_keys=True)
     
     trainer = CastFloatInputsTrainer(
         model=model,

@@ -97,8 +97,8 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=16)
     p.add_argument("--max_new_tokens", type=int, default=256)
 
-    p.add_argument("--use_pos_emb", type=bool, default=False)
-    p.add_argument("--use_channel_emb", type=bool, default=False)
+    p.add_argument("--use_pos_emb", action='store_true')
+    p.add_argument("--use_channel_emb", action='store_true')
 
     p.add_argument(
         "--model_path",
