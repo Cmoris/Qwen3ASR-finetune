@@ -1,1 +1,0 @@
-language Japanese<asr_text><speaker_A>はーいお願いしま</speaker_A><pause><speaker_A>なんか</speaker_A><ts><bc><speaker_B>今日</speaker_B>

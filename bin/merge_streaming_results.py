@@ -2,6 +2,8 @@ import argparse
 import json
 from pathlib import Path
 
+from infer_utils import SPECIAL_TOKENS, special_token_classification_metrics
+
 
 def empty_summary():
     return {}
@@ -22,6 +24,12 @@ def update_summary(summary, step_ms: int, metrics: dict):
                 "tp": 0,
                 "fp": 0,
                 "fn": 0,
+            },
+            "special_token_classification": {
+                "per_token": {
+                    token: {"tp": 0, "fp": 0, "fn": 0}
+                    for token in SPECIAL_TOKENS
+                },
             },
         }
 
@@ -44,6 +52,13 @@ def update_summary(summary, step_ms: int, metrics: dict):
     item["special_sequence"]["fp"] += int(fp)
     item["special_sequence"]["fn"] += int(fn)
 
+    classification = metrics["special_token_classification"]
+    for token in SPECIAL_TOKENS:
+        source = classification["per_token"][token]
+        target = item["special_token_classification"]["per_token"][token]
+        for field in ("tp", "fp", "fn"):
+            target[field] += int(source.get(field, 0))
+
 
 def finalize_summary(summary):
     for step_key, item in summary.items():
@@ -62,6 +77,64 @@ def finalize_summary(summary):
         s["precision"] = precision
         s["recall"] = recall
         s["f1"] = f1
+
+        classification = item["special_token_classification"]
+        per_token = classification["per_token"]
+        total_tp = 0
+        total_fp = 0
+        total_fn = 0
+        total_support = 0
+
+        for stat in per_token.values():
+            tp, fp, fn = stat["tp"], stat["fp"], stat["fn"]
+            stat["predicted"] = tp + fp
+            stat["support"] = tp + fn
+            stat["precision"] = tp / max(tp + fp, 1)
+            stat["recall"] = tp / max(tp + fn, 1)
+            stat["f1"] = (
+                2
+                * stat["precision"]
+                * stat["recall"]
+                / max(stat["precision"] + stat["recall"], 1e-8)
+            )
+            total_tp += tp
+            total_fp += fp
+            total_fn += fn
+            total_support += stat["support"]
+
+        micro_precision = total_tp / max(total_tp + total_fp, 1)
+        micro_recall = total_tp / max(total_tp + total_fn, 1)
+        classification["micro_avg"] = {
+            "tp": total_tp,
+            "fp": total_fp,
+            "fn": total_fn,
+            "predicted": total_tp + total_fp,
+            "support": total_support,
+            "precision": micro_precision,
+            "recall": micro_recall,
+            "f1": (
+                2
+                * micro_precision
+                * micro_recall
+                / max(micro_precision + micro_recall, 1e-8)
+            ),
+        }
+
+        classification["macro_avg"] = {
+            metric: sum(stat[metric] for stat in per_token.values())
+            / max(len(per_token), 1)
+            for metric in ("precision", "recall", "f1")
+        }
+        classification["macro_avg"]["support"] = total_support
+
+        classification["weighted_avg"] = {
+            metric: sum(
+                stat[metric] * stat["support"] for stat in per_token.values()
+            )
+            / max(total_support, 1)
+            for metric in ("precision", "recall", "f1")
+        }
+        classification["weighted_avg"]["support"] = total_support
 
     return summary
 
@@ -95,8 +168,22 @@ def main():
 
     with output_path.open("w", encoding="utf-8") as fout:
         for obj in rows:
+            metrics = obj.setdefault("metrics", {})
+            if "special_token_classification" not in metrics:
+                if "pred_text" not in obj or "ref_text" not in obj:
+                    raise KeyError(
+                        "Cannot compute special-token classification metrics: "
+                        "row is missing pred_text or ref_text"
+                    )
+                metrics["special_token_classification"] = (
+                    special_token_classification_metrics(
+                        pred=obj["pred_text"],
+                        ref=obj["ref_text"],
+                    )
+                )
+
             fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-            update_summary(summary, obj["step_ms"], obj["metrics"])
+            update_summary(summary, obj["step_ms"], metrics)
 
     summary = finalize_summary(summary)
 

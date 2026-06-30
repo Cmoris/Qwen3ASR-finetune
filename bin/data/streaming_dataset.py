@@ -153,6 +153,7 @@ def collect_asr_prefix_for_utterance(
     text_stream,
     utterance,
     cutoff_time: float,
+    utterance_end: Optional[float] = None,
 ):
     """
     从 text_stream 里取出属于当前 utterance 的、cutoff 之前的 ASR token。
@@ -161,6 +162,8 @@ def collect_asr_prefix_for_utterance(
     speaker = utterance["speaker"]
     u_start = float(utterance["start"])
     u_end = float(utterance["end"])
+    if utterance_end is not None:
+        u_end = min(u_end, float(utterance_end))
 
     toks = []
 
@@ -195,7 +198,11 @@ def build_parallel_utterance_prefix_target(
     include_empty_speaker: bool = False,
 ):
     """
-    A/B 并行输出，但事件 token 放在 speaker tag 外面。
+    按 utterance 的起始时间输出，事件 token 放在 speaker tag 外面。
+
+    两个 speaker 发生重叠时，较早开始的 utterance 截止到后开始的
+    utterance 的 start。被截断的文本必须从带时间戳的 text_stream 重建，
+    这样不会把较早 speaker 的重叠文本输出到较晚 speaker 之后。
 
     输出形式:
       language Japanese<asr_text>
@@ -204,18 +211,17 @@ def build_parallel_utterance_prefix_target(
       <speaker_B>...</speaker_B><te>
     """
 
-    speaker_pieces = {
-        "A": [],
-        "B": [],
-    }
+    pieces = []
+    if add_language_prefix:
+        pieces.append("language Japanese<asr_text>")
 
-    # 按 utterance 原本时间排序；但最后输出时仍然 A track / B track 分开
+    # Python 的排序是稳定的；start/end 相同时保留标注中的原始顺序。
     utts = sorted(
         utterances,
         key=lambda u: (float(u["start"]), float(u["end"]))
     )
 
-    for u in utts:
+    for index, u in enumerate(utts):
         speaker = u["speaker"]
         if speaker not in {"A", "B"}:
             continue
@@ -227,48 +233,43 @@ def build_parallel_utterance_prefix_target(
         if u_start > cutoff_time:
             continue
 
-        # 已完成 utterance：可以直接用 utterance text，也可以用 text_stream 重建
-        if u_end <= cutoff_time:
+        # 如果另一位 speaker 在当前 utterance 结束前开始说话，丢弃当前
+        # utterance 从该时刻起的重叠文本。后开始的 utterance 会在后续
+        # iteration 中按时间顺序正常输出。
+        visible_end = u_end
+        for later in utts[index + 1:]:
+            later_start = float(later["start"])
+            if later_start >= u_end:
+                break
+            if later.get("speaker") != speaker and later_start > u_start:
+                visible_end = later_start
+                break
+
+        was_truncated_by_overlap = visible_end < u_end
+        utterance_completed = u_end <= cutoff_time
+
+        if utterance_completed and not was_truncated_by_overlap:
             text = u.get("text", "").strip()
 
-            # 如果你更信任 forced alignment 后的 text_stream，也可以换成下面这个：
-            # text = collect_asr_prefix_for_utterance(text_stream, u, cutoff_time)
-
-            if text:
-                spk_tag = "speaker_A" if speaker == "A" else "speaker_B"
-                speaker_pieces[speaker].append(
-                    f"<{spk_tag}>{text}</{spk_tag}>"
-                )
-
-            # 事件 token 放在 speaker tag 外面
-            suffix = build_event_suffix_from_utterance(u)
-            if suffix:
-                speaker_pieces[speaker].append(suffix)
-
         else:
-            # 未完成 utterance：只输出当前 cutoff 前已经出现的 ASR prefix，不输出事件
+            # 未完成或被重叠截断的 utterance 只能从时间对齐结果重建。
             text = collect_asr_prefix_for_utterance(
                 text_stream=text_stream,
                 utterance=u,
                 cutoff_time=cutoff_time,
+                utterance_end=visible_end,
             )
 
-            if text:
-                spk_tag = "speaker_A" if speaker == "A" else "speaker_B"
-                speaker_pieces[speaker].append(
-                    f"<{spk_tag}>{text}</{spk_tag}>"
-                )
+        if text or include_empty_speaker:
+            spk_tag = "speaker_A" if speaker == "A" else "speaker_B"
+            pieces.append(f"<{spk_tag}>{text}</{spk_tag}>")
 
-    pieces = []
-
-    if add_language_prefix:
-        pieces.append("language Japanese<asr_text>")
-
-    if include_empty_speaker or speaker_pieces["A"]:
-        pieces.extend(speaker_pieces["A"])
-
-    if include_empty_speaker or speaker_pieces["B"]:
-        pieces.extend(speaker_pieces["B"])
+        # 事件描述的是原 utterance 的结束状态，只有原 utterance 完整进入
+        # 当前 prefix 后才输出。
+        if utterance_completed:
+            suffix = build_event_suffix_from_utterance(u)
+            if suffix:
+                pieces.append(suffix)
 
     return "".join(pieces)
 
@@ -442,13 +443,12 @@ class IncrementalDualChannelConvDataset(Dataset):
 
         cutoff = sample["cutoff"]
         prev_cutoff = sample["prev_cutoff"]
-        breakpoint()
         chunk_a, chunk_b, audio_start, audio_end = self._build_audio_prefix(
             conv_id=conv_id,
             t_start=t_start,
             cutoff=cutoff,
         )
-
+        
         if self.target_mode == "cumulative":
             target_text = build_parallel_utterance_prefix_target(
                 utterances=utterances,
@@ -712,7 +712,7 @@ Output the transcript in chronological order."""
     collator = DataCollatorForDualChannelQwen3ASRFinetuning(processor=processor,
                                                             use_channel_emb=False,
                                                             use_pos_emb=False)
-    loader = DataLoader(ds, batch_size=4, num_workers=16, shuffle=False, collate_fn=collator)
+    loader = DataLoader(ds, batch_size=1, num_workers=16, shuffle=False, collate_fn=collator)
     max_size = 0
     for batch in tqdm.tqdm(loader):
         

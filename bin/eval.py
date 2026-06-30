@@ -366,9 +366,7 @@ Output the transcript in chronological order."""
             meta = {
                 "target_texts": batch.pop("target_texts"),
                 "prefix_texts": batch.pop("prefix_texts"),
-                "audio_path_a": batch.pop("audio_path_a"),
-                "audio_path_b": batch.pop("audio_path_b"),
-                "audio_list": batch.pop("audio_list"),
+                "conv_ids": batch.pop("conv_ids")
             }
             
             batch = batch["prefix_inputs"]
@@ -412,9 +410,7 @@ Output the transcript in chronological order."""
                     "pred_text": pred_text,
                     "pred_raw": pred,
                     "ref_text": ref_text,
-                    "audio_path_a": meta["audio_path_a"][i],
-                    "audio_path_b": meta["audio_path_b"][i],
-                    "prefix_text": meta["prefix_texts"][i],
+                    "conv_ids": meta["conv_ids"][i],
                     "metrics": metrics,
                 }
                 

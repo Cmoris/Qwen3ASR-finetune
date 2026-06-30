@@ -1,1 +1,0 @@
-language Japanese<asr_text><speaker_A>こんにちは</speaker_A><speaker_B>あっ、こんにち</speaker_B>

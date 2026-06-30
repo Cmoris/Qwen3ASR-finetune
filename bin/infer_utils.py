@@ -136,6 +136,84 @@ def collect_special_tokens(seq: str):
     events = parse_sequence(seq)
     return [value for typ, _, value in events if typ == "special"]
 
+
+def _classification_stats(tp: int, fp: int, fn: int):
+    """Build precision/recall/F1 statistics from occurrence counts."""
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+
+    return {
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "predicted": tp + fp,
+        "support": tp + fn,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
+
+
+def special_token_classification_metrics(pred: str, ref: str):
+    """
+    Compute occurrence-based classification metrics for each special token.
+
+    Matching is performed independently for every token type. If a token occurs
+    ``p`` times in the prediction and ``r`` times in the reference, its counts
+    are ``tp=min(p, r)``, ``fp=max(p-r, 0)`` and ``fn=max(r-p, 0)``.
+
+    Accuracy is intentionally omitted: event sequences do not have a meaningful
+    true-negative population. ``special_token_f1_sequence`` should be used when
+    the order of different special-token types also needs to be evaluated.
+    """
+    pred_counts = Counter(collect_special_tokens(pred))
+    ref_counts = Counter(collect_special_tokens(ref))
+
+    per_token = {}
+    for token in SPECIAL_TOKENS:
+        pred_count = pred_counts[token]
+        ref_count = ref_counts[token]
+        tp = min(pred_count, ref_count)
+        per_token[token] = _classification_stats(
+            tp=tp,
+            fp=pred_count - tp,
+            fn=ref_count - tp,
+        )
+
+    total_tp = sum(stat["tp"] for stat in per_token.values())
+    total_fp = sum(stat["fp"] for stat in per_token.values())
+    total_fn = sum(stat["fn"] for stat in per_token.values())
+    micro_avg = _classification_stats(total_tp, total_fp, total_fn)
+
+    num_tokens = len(SPECIAL_TOKENS)
+    total_support = sum(stat["support"] for stat in per_token.values())
+    macro_avg = {
+        metric: sum(stat[metric] for stat in per_token.values()) / max(num_tokens, 1)
+        for metric in ("precision", "recall", "f1")
+    }
+    macro_avg["support"] = total_support
+
+    weighted_avg = {
+        metric: (
+            sum(
+                stat[metric] * stat["support"]
+                for stat in per_token.values()
+            )
+            / max(total_support, 1)
+        )
+        for metric in ("precision", "recall", "f1")
+    }
+    weighted_avg["support"] = total_support
+
+    return {
+        "per_token": per_token,
+        "micro_avg": micro_avg,
+        "macro_avg": macro_avg,
+        "weighted_avg": weighted_avg,
+    }
+
+
 def special_token_f1_sequence(pred: str, ref: str):
     pred_tokens = collect_special_tokens(pred)
     ref_tokens = collect_special_tokens(ref)
@@ -158,8 +236,8 @@ def special_token_f1_sequence(pred: str, ref: str):
         "recall": recall,
         "f1": f1,
     }
-    
+
+
 if __name__ == "__main__":
     ref = "language Japanese<asr_text><speaker_B>それさえもなんかいやったいいやったい食べるので</speaker_B><ts><speaker_A>あっ</speaker_A><pause><speaker_A>そうなんだ</speaker_A>"
     pred = "<speaker_B>それさえもなんかや</speaker_B><bc><speaker_A>ん</speaker_A><bc><speaker_B>ってなると食べるの（笑language Japanese<asr_text><speaker_B>それさえも、なんか、やったいやったり食べるので</speaker_B><ts><speaker_A>あ</speaker_A><pause><speaker_A>そうなんだ</speaker_A>"
-    

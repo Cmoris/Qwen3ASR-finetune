@@ -1,1 +1,0 @@
-language Japanese<asr_text><speaker_B>今日</speaker_B><pause><speaker_B>どっ</speaker_B><ts><bc><speaker_A>うん</speaker_A><te>

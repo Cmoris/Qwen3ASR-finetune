@@ -1,1 +1,0 @@
-language Japanese<asr_text><speaker_B>どちらからですかね?うちの所はすごいよく</speaker_B><speaker_B>いい天気なんですけど</speaker_B><ts><speaker_A>と</speaker_A>

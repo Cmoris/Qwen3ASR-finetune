@@ -200,7 +200,7 @@ class DataCollatorForDualChannelQwen3ASRFinetuning:
         full_inputs["prefix_inputs"] = prefix_inputs
         full_inputs["prefix_texts"] = prefix_texts
         full_inputs["target_texts"] = targets
-        
+        full_inputs["conv_ids"] = conv_ids
         
         return full_inputs
     
