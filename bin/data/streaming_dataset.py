@@ -490,7 +490,11 @@ class IncrementalDualChannelConvDataset(Dataset):
 def save_dataset_samples_for_inspection(
     dataset: Dataset,
     output_dir: str | Path,
+<<<<<<< HEAD
     num_samples: int = 100,
+=======
+    num_samples: int = 10,
+>>>>>>> aa6d943dec1b90aeae264c96fc2f1eeb7b572e23
     start_index: int = 0,
     save_stereo: bool = True,
 ) -> list[Path]:
@@ -703,7 +707,11 @@ Output the transcript in chronological order."""
     saved_dirs = save_dataset_samples_for_inspection(
         dataset=ds,
         output_dir="debug_streaming_samples",
+<<<<<<< HEAD
         num_samples=100,
+=======
+        num_samples=10,
+>>>>>>> aa6d943dec1b90aeae264c96fc2f1eeb7b572e23
         start_index=0,
     )
     print(saved_dirs)
