@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -9,6 +10,7 @@ from typing import Any, Dict, List, Optional, Literal
 from types import MethodType
 
 import torch
+import torch.nn.functional as F
 from qwen_asr import Qwen3ASRModel
 from transformers import (GenerationConfig, Trainer, TrainerCallback,
                           TrainingArguments)
@@ -78,6 +80,39 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
 
 
 class CastFloatInputsTrainer(Trainer):
+    def __init__(self, *args, token_id_weights=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.token_id_weights = dict(token_id_weights or {})
+        for token_id, weight in self.token_id_weights.items():
+            if token_id < 0 or not math.isfinite(weight) or weight <= 0:
+                raise ValueError("Token IDs must be nonnegative and weights finite and positive.")
+        # Each micro-batch returns a weighted mean; Trainer handles accumulation scaling.
+        self.model_accepts_loss_kwargs = False
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        model_inputs = dict(inputs)
+        labels = model_inputs.pop("labels")
+        for key in ("prefix_inputs", "prefix_texts", "target_texts", "conv_ids"):
+            model_inputs.pop(key, None)
+        outputs = model(**model_inputs)
+        shift_logits = outputs.logits[..., :-1, :]
+        shift_labels = labels[..., 1:].to(shift_logits.device)
+        valid = shift_labels.ne(-100)
+        target = shift_labels[valid]
+        logits = shift_logits[valid].float()
+        if target.numel() == 0:
+            # Keep a differentiable zero so backward also works for fully masked batches.
+            loss = logits.sum()
+            return (loss, outputs) if return_outputs else loss
+        token_loss = F.cross_entropy(logits, target, reduction="none")
+
+        weights = torch.ones_like(token_loss)
+        for token_id, weight in self.token_id_weights.items():
+            weights = torch.where(target == token_id, weight, weights)
+
+        loss = (token_loss * weights).sum() / weights.sum()
+        return (loss, outputs) if return_outputs else loss
+
     def _prepare_inputs(self, inputs):
         inputs = super()._prepare_inputs(inputs)
         model_dtype = getattr(self.model, "dtype", None)
@@ -203,6 +238,10 @@ def parse_args():
     p.add_argument("--report_to", type=str, default=None)
     p.add_argument("--use_pos_emb", action='store_true')
     p.add_argument("--use_channel_emb", action='store_true')
+    p.add_argument("--event_token_weight", type=float, default=2.0,
+                   help="Loss weight for ts/te/bc/pause/silence tokens (default: 2).")
+    p.add_argument("--speaker_token_weight", type=float, default=1.0,
+                   help="Loss weight for speaker opening/closing tokens (default: 1).")
     # LoRA / PEFT
     p.add_argument("--lora_enable", type=bool, default=False)
     p.add_argument("--lora_r", type=int, default=16)
@@ -239,7 +278,12 @@ def parse_args():
     p.add_argument("--resume_from", type=str, default="")
     p.add_argument("--resume", type=int, default=0)
 
-    return p.parse_args()
+    args = p.parse_args()
+    for name in ("event_token_weight", "speaker_token_weight"):
+        weight = getattr(args, name)
+        if not math.isfinite(weight) or weight <= 0:
+            p.error(f"--{name} must be finite and greater than zero")
+    return args
 
 def make_dialogue_module(processor,
                         data_args,
@@ -326,6 +370,16 @@ def main():
         SPEAKER_TOKENS["B"][1],
     ]
     processor.tokenizer.add_tokens(new_tokens, special_tokens=False)
+    event_tokens = {TS_TOKEN, TE_TOKEN, BC_TOKEN, PAUSE_TOKEN, SILENCE_TOKEN}
+    token_id_weights = {}
+    for token in new_tokens:
+        token_ids = processor.tokenizer.encode(token, add_special_tokens=False)
+        if len(token_ids) != 1:
+            raise ValueError(f"Expected one token ID for {token!r}, got {token_ids}")
+        token_id_weights[token_ids[0]] = (
+            args_cli.event_token_weight if token in event_tokens
+            else args_cli.speaker_token_weight
+        )
     
     query = """You are a streaming dialogue transcriber.
 
@@ -397,6 +451,7 @@ def main():
     
     trainer = CastFloatInputsTrainer(
         model=model,
+        token_id_weights=token_id_weights,
         args=training_args,
         **data_module,
         tokenizer=processor.tokenizer,
